@@ -229,6 +229,7 @@ pyrightconfig.json
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,macos,python
 
 # Custom rules (everything added below won't be overriden by 'Generate .gitignore File' if you use 'Update' option)
+abelian_sandpile/sandpile_data/
 
 # Simulation visuals / temporary assets
 *.png
@@ -237,3 +238,4 @@ pyrightconfig.json
 *.gif
 *.mp4
 *.mov
+*.avi
