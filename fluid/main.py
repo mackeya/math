@@ -4,7 +4,7 @@ from simulation import FluidSimulation
 
 def main():
     res = 512
-    init_type = 'image'
+    init_type = 'patterns'
     sim = FluidSimulation(res)
     if init_type == 'patterns':
         sim.init_patterns()
@@ -27,6 +27,7 @@ def main():
     print("  Key R: Reset Patterns")
     print("  Key F: Apply force to bottom half")
     print("  Key G: Apply image gradient force (gradual)")
+    print("  Key D: Apply dye gradient force (gradual/dynamic)")
 
     prev_mouse = None
 
@@ -50,7 +51,9 @@ def main():
                 elif init_type == 'image':
                     sim.init_from_image("./lenna.png")
             elif gui.event.key == 'g':
-                sim.apply_image_gradient_force("./lenna.png", scale=10.0, duration=0.5, blur_sigma=10.0)
+                sim.apply_image_gradient_torque("./lenna.png", scale=1.0, duration=0.1, blur_sigma=1.0)
+            elif gui.event.key == 'd':
+                sim.apply_dye_gradient_torque(scale=0.1, duration=0.1)
 
         # Handle mouse interaction
         curr_mouse = gui.get_cursor_pos()

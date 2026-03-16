@@ -58,6 +58,7 @@ class FluidSimulation:
         self.image_grad = ti.Vector.field(2, float, shape=(res, res))
         self.force_duration = 0.0
         self.force_scale = 0.0
+        self.dye_force_active = False
 
     @ti.kernel
     def init_patterns(self):
@@ -69,14 +70,14 @@ class FluidSimulation:
         self.vel.fill(0)
         self.p.fill(0)
         for i, j in self.rho:
-            # Create a grid of dye
-            if (i // 32) % 2 == 0 and (j // 32) % 2 == 0:
+            # Create a grid of dye symmetric around the center
+            if ((i + 16) // 32) % 2 == 0 and ((j + 16) // 32) % 2 == 0:
                 self.rho[i, j] = 1.0
 
-            # Add a central circle
-            dist = (ti.Vector([i * self.dx, j * self.dx]) - ti.Vector([0.5, 0.5])).norm()
-            if dist < 0.1:
-                self.rho[i, j] = 1.0
+            # # Add a central circle
+            # dist = (ti.Vector([i * self.dx, j * self.dx]) - ti.Vector([0.5, 0.5])).norm()
+            # if dist < 0.1:
+            #     self.rho[i, j] = 1.0
 
     def init_from_image(self, image_path: str):
         """
@@ -147,7 +148,7 @@ class FluidSimulation:
             if j < self.res / 2:
                 self.vel[i, j] += ti.Vector([f_x, f_y]) * self.dt
 
-    def apply_image_gradient_force(self, image_path: str, scale: float = 1.0, duration: float = 0.1, blur_sigma: float = 0.0):
+    def apply_image_gradient_torque(self, image_path: str, scale: float = 1.0, duration: float = 0.1, blur_sigma: float = 0.0):
         """
         Reads an image and sets up a force to be applied to the fluid equal to
         the gradient of the image, spread over a certain duration.
@@ -188,12 +189,23 @@ class FluidSimulation:
 
         # Use p_temp as a temporary field to hold the image
         self.p_temp.from_numpy(img_np)
-        self._precompute_image_gradient(self.p_temp)
+        self._precompute_gradient_perp(self.p_temp)
         self.force_scale = scale
         self.force_duration = duration
+        self.dye_force_active = False
+
+    def apply_dye_gradient_torque(self, scale: float = 1.0, duration: float = 0.1):
+        """
+        Sets up a force to be applied to the fluid proportional to the gradient
+        of the current dye concentration (rho). This force is dynamic and
+        recalculated at each step as the dye field evolves.
+        """
+        self.force_scale = scale
+        self.force_duration = duration
+        self.dye_force_active = True
 
     @ti.kernel
-    def _precompute_image_gradient(self, img: ti.template()):
+    def _precompute_gradient(self, img: ti.template()):
         for i, j in self.image_grad:
             im1 = (i - 1) % self.res
             ip1 = (i + 1) % self.res
@@ -204,6 +216,19 @@ class FluidSimulation:
             grad_y = (img[i, jp1] - img[i, jm1]) * 0.5 / self.dx
 
             self.image_grad[i, j] = ti.Vector([grad_x, grad_y])
+
+    @ti.kernel
+    def _precompute_gradient_perp(self, x: ti.template()):
+        for i, j in self.image_grad:
+            im1 = (i - 1) % self.res
+            ip1 = (i + 1) % self.res
+            jm1 = (j - 1) % self.res
+            jp1 = (j + 1) % self.res
+
+            grad_x = (x[ip1, j] - x[im1, j]) * 0.5 / self.dx
+            grad_y = (x[i, jp1] - x[i, jm1]) * 0.5 / self.dx
+
+            self.image_grad[i, j] = ti.Vector([grad_y, -grad_x])
 
     @ti.kernel
     def _apply_stored_force(self):
@@ -687,10 +712,15 @@ class FluidSimulation:
             self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel, True)
             self.vel.copy_from(self.new_vel)
 
-        # Apply external forces (e.g. image gradient)
+        # Apply external forces (e.g. image gradient or dye gradient)
         if self.force_duration > 0:
+            if self.dye_force_active:
+                # Dynamic force: update gradient from current dye field
+                self._precompute_gradient_perp(self.rho)
             self._apply_stored_force()
             self.force_duration -= self.dt
+        else:
+            self.dye_force_active = False
 
         # Projection (Chorin's Projection Method)
         self.compute_divergence()
