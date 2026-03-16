@@ -96,7 +96,7 @@ def main():
         4: "WENO5"
     }
 
-    resolutions = [32, 64, 128]
+    resolutions = [32, 64, 128, 256]
     ic_types = ["smooth", "square", "triangle"]
     T = 0.1
 
