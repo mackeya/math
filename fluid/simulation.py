@@ -340,23 +340,14 @@ class FluidSimulation:
             new_field[i, j] = 0.5 * (field[i, j] + val_corr)
 
     @ti.func
-    def minmod_scalar(self, a, b):
-        res = 0.0
-        if a * b > 0.0:
-            if ti.abs(a) < ti.abs(b):
-                res = a
-            else:
-                res = b
-        return res
-
-    @ti.func
-    def minmod_vec2(self, a, b):
-        return ti.Vector([self.minmod_scalar(a.x, b.x), self.minmod_scalar(a.y, b.y)])
+    def minmod(self, a, b):
+        return 0.5 * (ti.math.sign(a) + ti.math.sign(b)) * ti.min(ti.abs(a), ti.abs(b))
 
     @ti.kernel
-    def advect_tvd_scalar(self, field: ti.template(), new_field: ti.template()):
+    def advect_tvd(self, field: ti.template(), new_field: ti.template()):
         """
         Solves the advection equation using a 2D TVD scheme with Minmod limiter (second-order).
+        Works for both scalar and vector fields.
         """
         for i, j in field:
             u = self.vel[i, j]
@@ -371,8 +362,8 @@ class FluidSimulation:
                 dq_i_plus_half = field[ip1, j] - field[i, j]
                 dq_i_minus_half = field[i, j] - field[im1, j]
                 dq_i_minus_3_half = field[im1, j] - field[im2, j]
-                flux_r = u.x * field[i, j] + 0.5 * u.x * (1.0 - c) * self.minmod_scalar(dq_i_plus_half, dq_i_minus_half)
-                flux_l = u.x * field[im1, j] + 0.5 * u.x * (1.0 - c) * self.minmod_scalar(dq_i_minus_half, dq_i_minus_3_half)
+                flux_r = u.x * field[i, j] + 0.5 * u.x * (1.0 - c) * self.minmod(dq_i_plus_half, dq_i_minus_half)
+                flux_l = u.x * field[im1, j] + 0.5 * u.x * (1.0 - c) * self.minmod(dq_i_minus_half, dq_i_minus_3_half)
                 val -= (self.dt / self.dx) * (flux_r - flux_l)
             else:
                 ip1 = (i + 1) % self.res
@@ -382,8 +373,8 @@ class FluidSimulation:
                 dq_i_minus_half = field[i, j] - field[im1, j]
                 dq_i_plus_half = field[ip1, j] - field[i, j]
                 dq_i_plus_3_half = field[ip2, j] - field[ip1, j]
-                flux_r = u.x * field[ip1, j] - 0.5 * u.x * (1.0 - c) * self.minmod_scalar(dq_i_plus_half, dq_i_plus_3_half)
-                flux_l = u.x * field[i, j] - 0.5 * u.x * (1.0 - c) * self.minmod_scalar(dq_i_minus_half, dq_i_plus_half)
+                flux_r = u.x * field[ip1, j] - 0.5 * u.x * (1.0 - c) * self.minmod(dq_i_plus_half, dq_i_plus_3_half)
+                flux_l = u.x * field[i, j] - 0.5 * u.x * (1.0 - c) * self.minmod(dq_i_minus_half, dq_i_plus_half)
                 val -= (self.dt / self.dx) * (flux_r - flux_l)
 
             # y direction flux difference
@@ -395,8 +386,8 @@ class FluidSimulation:
                 dq_j_plus_half = field[i, jp1] - field[i, j]
                 dq_j_minus_half = field[i, j] - field[i, jm1]
                 dq_j_minus_3_half = field[i, jm1] - field[i, jm2]
-                flux_t = u.y * field[i, j] + 0.5 * u.y * (1.0 - c) * self.minmod_scalar(dq_j_plus_half, dq_j_minus_half)
-                flux_b = u.y * field[i, jm1] + 0.5 * u.y * (1.0 - c) * self.minmod_scalar(dq_j_minus_half, dq_j_minus_3_half)
+                flux_t = u.y * field[i, j] + 0.5 * u.y * (1.0 - c) * self.minmod(dq_j_plus_half, dq_j_minus_half)
+                flux_b = u.y * field[i, jm1] + 0.5 * u.y * (1.0 - c) * self.minmod(dq_j_minus_half, dq_j_minus_3_half)
                 val -= (self.dt / self.dx) * (flux_t - flux_b)
             else:
                 jp1 = (j + 1) % self.res
@@ -406,73 +397,14 @@ class FluidSimulation:
                 dq_j_minus_half = field[i, j] - field[i, jm1]
                 dq_j_plus_half = field[i, jp1] - field[i, j]
                 dq_j_plus_3_half = field[i, jp2] - field[i, jp1]
-                flux_t = u.y * field[i, jp1] - 0.5 * u.y * (1.0 - c) * self.minmod_scalar(dq_j_plus_half, dq_j_plus_3_half)
-                flux_b = u.y * field[i, j] - 0.5 * u.y * (1.0 - c) * self.minmod_scalar(dq_j_minus_half, dq_j_plus_half)
-                val -= (self.dt / self.dx) * (flux_t - flux_b)
-
-            new_field[i, j] = val
-
-    @ti.kernel
-    def advect_tvd_vec(self, field: ti.template(), new_field: ti.template()):
-        """
-        Solves the advection equation using a 2D TVD scheme with Minmod limiter (second-order) for vector fields.
-        """
-        for i, j in field:
-            u = self.vel[i, j]
-            val = field[i, j]
-
-            # x direction flux difference
-            if u.x > 0:
-                im1 = (i - 1) % self.res
-                im2 = (i - 2) % self.res
-                ip1 = (i + 1) % self.res
-                c = u.x * self.dt / self.dx
-                dq_i_plus_half = field[ip1, j] - field[i, j]
-                dq_i_minus_half = field[i, j] - field[im1, j]
-                dq_i_minus_3_half = field[im1, j] - field[im2, j]
-                flux_r = u.x * field[i, j] + 0.5 * u.x * (1.0 - c) * self.minmod_vec2(dq_i_plus_half, dq_i_minus_half)
-                flux_l = u.x * field[im1, j] + 0.5 * u.x * (1.0 - c) * self.minmod_vec2(dq_i_minus_half, dq_i_minus_3_half)
-                val -= (self.dt / self.dx) * (flux_r - flux_l)
-            else:
-                ip1 = (i + 1) % self.res
-                ip2 = (i + 2) % self.res
-                im1 = (i - 1) % self.res
-                c = -u.x * self.dt / self.dx
-                dq_i_minus_half = field[i, j] - field[im1, j]
-                dq_i_plus_half = field[ip1, j] - field[i, j]
-                dq_i_plus_3_half = field[ip2, j] - field[ip1, j]
-                flux_r = u.x * field[ip1, j] - 0.5 * u.x * (1.0 - c) * self.minmod_vec2(dq_i_plus_half, dq_i_plus_3_half)
-                flux_l = u.x * field[i, j] - 0.5 * u.x * (1.0 - c) * self.minmod_vec2(dq_i_minus_half, dq_i_plus_half)
-                val -= (self.dt / self.dx) * (flux_r - flux_l)
-
-            # y direction flux difference
-            if u.y > 0:
-                jm1 = (j - 1) % self.res
-                jm2 = (j - 2) % self.res
-                jp1 = (j + 1) % self.res
-                c = u.y * self.dt / self.dx
-                dq_j_plus_half = field[i, jp1] - field[i, j]
-                dq_j_minus_half = field[i, j] - field[i, jm1]
-                dq_j_minus_3_half = field[i, jm1] - field[i, jm2]
-                flux_t = u.y * field[i, j] + 0.5 * u.y * (1.0 - c) * self.minmod_vec2(dq_j_plus_half, dq_j_minus_half)
-                flux_b = u.y * field[i, jm1] + 0.5 * u.y * (1.0 - c) * self.minmod_vec2(dq_j_minus_half, dq_j_minus_3_half)
-                val -= (self.dt / self.dx) * (flux_t - flux_b)
-            else:
-                jp1 = (j + 1) % self.res
-                jp2 = (j + 2) % self.res
-                jm1 = (j - 1) % self.res
-                c = -u.y * self.dt / self.dx
-                dq_j_minus_half = field[i, j] - field[i, jm1]
-                dq_j_plus_half = field[i, jp1] - field[i, j]
-                dq_j_plus_3_half = field[i, jp2] - field[i, jp1]
-                flux_t = u.y * field[i, jp1] - 0.5 * u.y * (1.0 - c) * self.minmod_vec2(dq_j_plus_half, dq_j_plus_3_half)
-                flux_b = u.y * field[i, j] - 0.5 * u.y * (1.0 - c) * self.minmod_vec2(dq_j_minus_half, dq_j_plus_half)
+                flux_t = u.y * field[i, jp1] - 0.5 * u.y * (1.0 - c) * self.minmod(dq_j_plus_half, dq_j_plus_3_half)
+                flux_b = u.y * field[i, j] - 0.5 * u.y * (1.0 - c) * self.minmod(dq_j_minus_half, dq_j_plus_half)
                 val -= (self.dt / self.dx) * (flux_t - flux_b)
 
             new_field[i, j] = val
 
     @ti.func
-    def weno5_reconstruct_scalar(self, v1, v2, v3, v4, v5):
+    def weno5_reconstruct(self, v1, v2, v3, v4, v5):
         eps = 1e-6
         p0 = (2.0 * v1 - 7.0 * v2 + 11.0 * v3) / 6.0
         p1 = (-v2 + 5.0 * v3 + 2.0 * v4) / 6.0
@@ -486,20 +418,14 @@ class FluidSimulation:
         sum_alpha = alpha0 + alpha1 + alpha2
         return (alpha0 * p0 + alpha1 * p1 + alpha2 * p2) / sum_alpha
 
-    @ti.func
-    def weno5_reconstruct_vec2(self, v1, v2, v3, v4, v5):
-        return ti.Vector([
-            self.weno5_reconstruct_scalar(v1.x, v2.x, v3.x, v4.x, v5.x),
-            self.weno5_reconstruct_scalar(v1.y, v2.y, v3.y, v4.y, v5.y)
-        ])
-
     @ti.kernel
-    def advect_weno_rhs_scalar(self, field: ti.template(), dq: ti.template()):
+    def advect_weno_rhs(self, field: ti.template(), dq: ti.template()):
         for i, j in field:
             u = self.vel[i, j]
-            flux_x = 0.0
-            flux_y = 0.0
-
+            
+            flux_x = field[i, j] * 0.0
+            flux_y = field[i, j] * 0.0
+            
             # x flux
             im3 = (i - 3) % self.res
             im2 = (i - 2) % self.res
@@ -508,12 +434,12 @@ class FluidSimulation:
             ip2 = (i + 2) % self.res
             ip3 = (i + 3) % self.res
             if u.x > 0:
-                q_R = self.weno5_reconstruct_scalar(field[im2, j], field[im1, j], field[i, j], field[ip1, j], field[ip2, j])
-                q_L = self.weno5_reconstruct_scalar(field[im3, j], field[im2, j], field[im1, j], field[i, j], field[ip1, j])
+                q_R = self.weno5_reconstruct(field[im2, j], field[im1, j], field[i, j], field[ip1, j], field[ip2, j])
+                q_L = self.weno5_reconstruct(field[im3, j], field[im2, j], field[im1, j], field[i, j], field[ip1, j])
                 flux_x = u.x * (q_R - q_L)
             else:
-                q_R = self.weno5_reconstruct_scalar(field[ip3, j], field[ip2, j], field[ip1, j], field[i, j], field[im1, j])
-                q_L = self.weno5_reconstruct_scalar(field[ip2, j], field[ip1, j], field[i, j], field[im1, j], field[im2, j])
+                q_R = self.weno5_reconstruct(field[ip3, j], field[ip2, j], field[ip1, j], field[i, j], field[im1, j])
+                q_L = self.weno5_reconstruct(field[ip2, j], field[ip1, j], field[i, j], field[im1, j], field[im2, j])
                 flux_x = u.x * (q_R - q_L)
 
             # y flux
@@ -524,53 +450,12 @@ class FluidSimulation:
             jp2 = (j + 2) % self.res
             jp3 = (j + 3) % self.res
             if u.y > 0:
-                q_T = self.weno5_reconstruct_scalar(field[i, jm2], field[i, jm1], field[i, j], field[i, jp1], field[i, jp2])
-                q_B = self.weno5_reconstruct_scalar(field[i, jm3], field[i, jm2], field[i, jm1], field[i, j], field[i, jp1])
+                q_T = self.weno5_reconstruct(field[i, jm2], field[i, jm1], field[i, j], field[i, jp1], field[i, jp2])
+                q_B = self.weno5_reconstruct(field[i, jm3], field[i, jm2], field[i, jm1], field[i, j], field[i, jp1])
                 flux_y = u.y * (q_T - q_B)
             else:
-                q_T = self.weno5_reconstruct_scalar(field[i, jp3], field[i, jp2], field[i, jp1], field[i, j], field[i, jm1])
-                q_B = self.weno5_reconstruct_scalar(field[i, jp2], field[i, jp1], field[i, j], field[i, jm1], field[i, jm2])
-                flux_y = u.y * (q_T - q_B)
-
-            dq[i, j] = -(flux_x + flux_y) / self.dx
-
-    @ti.kernel
-    def advect_weno_rhs_vec(self, field: ti.template(), dq: ti.template()):
-        for i, j in field:
-            u = self.vel[i, j]
-            flux_x = ti.Vector([0.0, 0.0])
-            flux_y = ti.Vector([0.0, 0.0])
-
-            # x flux
-            im3 = (i - 3) % self.res
-            im2 = (i - 2) % self.res
-            im1 = (i - 1) % self.res
-            ip1 = (i + 1) % self.res
-            ip2 = (i + 2) % self.res
-            ip3 = (i + 3) % self.res
-            if u.x > 0:
-                q_R = self.weno5_reconstruct_vec2(field[im2, j], field[im1, j], field[i, j], field[ip1, j], field[ip2, j])
-                q_L = self.weno5_reconstruct_vec2(field[im3, j], field[im2, j], field[im1, j], field[i, j], field[ip1, j])
-                flux_x = u.x * (q_R - q_L)
-            else:
-                q_R = self.weno5_reconstruct_vec2(field[ip3, j], field[ip2, j], field[ip1, j], field[i, j], field[im1, j])
-                q_L = self.weno5_reconstruct_vec2(field[ip2, j], field[ip1, j], field[i, j], field[im1, j], field[im2, j])
-                flux_x = u.x * (q_R - q_L)
-
-            # y flux
-            jm3 = (j - 3) % self.res
-            jm2 = (j - 2) % self.res
-            jm1 = (j - 1) % self.res
-            jp1 = (j + 1) % self.res
-            jp2 = (j + 2) % self.res
-            jp3 = (j + 3) % self.res
-            if u.y > 0:
-                q_T = self.weno5_reconstruct_vec2(field[i, jm2], field[i, jm1], field[i, j], field[i, jp1], field[i, jp2])
-                q_B = self.weno5_reconstruct_vec2(field[i, jm3], field[i, jm2], field[i, jm1], field[i, j], field[i, jp1])
-                flux_y = u.y * (q_T - q_B)
-            else:
-                q_T = self.weno5_reconstruct_vec2(field[i, jp3], field[i, jp2], field[i, jp1], field[i, j], field[i, jm1])
-                q_B = self.weno5_reconstruct_vec2(field[i, jp2], field[i, jp1], field[i, j], field[i, jm1], field[i, jm2])
+                q_T = self.weno5_reconstruct(field[i, jp3], field[i, jp2], field[i, jp1], field[i, j], field[i, jm1])
+                q_B = self.weno5_reconstruct(field[i, jp2], field[i, jp1], field[i, j], field[i, jm1], field[i, jm2])
                 flux_y = u.y * (q_T - q_B)
 
             dq[i, j] = -(flux_x + flux_y) / self.dx
@@ -590,23 +475,14 @@ class FluidSimulation:
         for i, j in field:
             new_field[i, j] = (1.0 / 3.0) * field[i, j] + (2.0 / 3.0) * field_2[i, j] + (2.0 / 3.0) * self.dt * dq[i, j]
 
-    def step_weno(self, field, field_1, field_2, new_field, dq, is_vec=False):
-        if is_vec:
-            self.advect_weno_rhs_vec(field, dq)
-        else:
-            self.advect_weno_rhs_scalar(field, dq)
+    def step_weno(self, field, field_1, field_2, new_field, dq):
+        self.advect_weno_rhs(field, dq)
         self.rk3_step1(field, field_1, dq)
 
-        if is_vec:
-            self.advect_weno_rhs_vec(field_1, dq)
-        else:
-            self.advect_weno_rhs_scalar(field_1, dq)
+        self.advect_weno_rhs(field_1, dq)
         self.rk3_step2(field, field_1, field_2, dq)
 
-        if is_vec:
-            self.advect_weno_rhs_vec(field_2, dq)
-        else:
-            self.advect_weno_rhs_scalar(field_2, dq)
+        self.advect_weno_rhs(field_2, dq)
         self.rk3_step3(field, field_2, new_field, dq)
 
     @ti.kernel
@@ -700,16 +576,16 @@ class FluidSimulation:
             self.advect_maccormack_step2(self.vel, self.new_vel, self.vel)
         elif self.advection_scheme == 3:
             # TVD
-            self.advect_tvd_scalar(self.rho, self.new_rho)
+            self.advect_tvd(self.rho, self.new_rho)
             self.rho.copy_from(self.new_rho)
-            self.advect_tvd_vec(self.vel, self.new_vel)
+            self.advect_tvd(self.vel, self.new_vel)
             self.vel.copy_from(self.new_vel)
 
         elif self.advection_scheme == 4:
             # WENO5 + SSP-RK3
-            self.step_weno(self.rho, self.rho_1, self.rho_2, self.new_rho, self.dq_rho, False)
+            self.step_weno(self.rho, self.rho_1, self.rho_2, self.new_rho, self.dq_rho)
             self.rho.copy_from(self.new_rho)
-            self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel, True)
+            self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
             self.vel.copy_from(self.new_vel)
 
         # Apply external forces (e.g. image gradient or dye gradient)
