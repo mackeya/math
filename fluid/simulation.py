@@ -148,6 +148,45 @@ class FluidSimulation:
             if j < self.res / 2:
                 self.vel[i, j] += ti.Vector([f_x, f_y]) * self.dt
 
+    @ti.kernel
+    def apply_dye_gravity(self, force_strength: float):
+        """
+        Applies a downward gravitational force proportional to the dye density.
+        """
+        for i, j in self.vel:
+            self.vel[i, j] += ti.Vector([0.0, -force_strength * self.rho[i, j]]) * self.dt
+
+    @ti.kernel
+    def apply_dye_buoyancy_torque(self, force_strength: float):
+        """
+        Applies a counter-clockwise rotational force proportional to the dye density,
+        centered around the middle of the domain.
+        """
+        for i, j in self.vel:
+            # Vector from center
+            r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
+            dist = r.norm()
+            if dist > 1e-6:
+                # Counter-clockwise direction: (-dy, dx)
+                force_dir = ti.Vector([-r.y, r.x]) / dist
+                self.vel[i, j] += force_dir * force_strength * self.rho[i, j] * self.dt
+
+    @ti.kernel
+    def apply_dye_buoyancy_radial(self, force_strength: float):
+        """
+        Applies a radial outward force proportional to the dye density,
+        centered around the middle of the domain.
+        """
+        for i, j in self.vel:
+            # Vector from center
+            r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
+            dist = r.norm()
+            if dist > 1e-6:
+                # Radial outward direction
+                force_dir = r / dist
+                self.vel[i, j] += force_dir * force_strength * self.rho[i, j] * self.dt
+
+
     def apply_image_gradient_torque(self, image_path: str, scale: float = 1.0, duration: float = 0.1, blur_sigma: float = 0.0):
         """
         Reads an image and sets up a force to be applied to the fluid equal to
@@ -422,10 +461,10 @@ class FluidSimulation:
     def advect_weno_rhs(self, field: ti.template(), dq: ti.template()):
         for i, j in field:
             u = self.vel[i, j]
-            
+
             flux_x = field[i, j] * 0.0
             flux_y = field[i, j] * 0.0
-            
+
             # x flux
             im3 = (i - 3) % self.res
             im2 = (i - 2) % self.res

@@ -4,7 +4,7 @@ from simulation import FluidSimulation
 
 def main():
     res = 512
-    init_type = 'patterns'
+    init_type = 'image'
     sim = FluidSimulation(res)
     if init_type == 'patterns':
         sim.init_patterns()
@@ -14,20 +14,20 @@ def main():
     gui = ti.GUI("2D Fluid Simulation Demo", res=(res, res))
 
     # Simple UI state
-    advection_names = ["Semi-Lagrangian", "Upwind", "MacCormack", "TVD", "WENO-5"]
+    advection_names = {0: "Semi-Lagrangian", 4: "WENO-5"}
 
     print("Controls:")
     print("  Mouse Left: Add Force (Drag)")
     print("  Mouse Right: Add Dye")
     print("  Key 1: Semi-Lagrangian (Stable, Smooth)")
-    print("  Key 2: Upwind (Stable, Diffusive)")
-    print("  Key 3: MacCormack (Sharp, Oscillatory)")
-    print("  Key 4: TVD (Minmod)")
-    print("  Key 5: WENO-5")
+    print("  Key 2: WENO-5")
     print("  Key R: Reset Patterns")
     print("  Key F: Apply force to bottom half")
+    print("  Key B: Apply dye gravity (hold)")
     print("  Key G: Apply image gradient force (gradual)")
     print("  Key D: Apply dye gradient force (gradual/dynamic)")
+    print("  Key V: Apply dye vortex (hold)")
+    print("  Key C: Apply dye radial (hold)")
 
     prev_mouse = None
 
@@ -37,12 +37,6 @@ def main():
             if gui.event.key == '1':
                 sim.advection_scheme = 0
             elif gui.event.key == '2':
-                sim.advection_scheme = 1
-            elif gui.event.key == '3':
-                sim.advection_scheme = 2
-            elif gui.event.key == '4':
-                sim.advection_scheme = 3
-            elif gui.event.key == '5':
                 sim.advection_scheme = 4
             elif gui.event.key == 'r':
                 sim.time = 0.0
@@ -70,6 +64,16 @@ def main():
 
         if gui.is_pressed('f'):
             sim.apply_bottom_force(1000.0, 200.0)
+
+        if gui.is_pressed('b'):
+            sim.apply_dye_gravity(3000.0)
+
+        if gui.is_pressed('v'):
+            sim.apply_dye_buoyancy_torque(3000.0)
+
+        if gui.is_pressed('c'):
+            # TODO: figure out pressure issues here
+            sim.apply_dye_buoyancy_radial(1000.0)
 
         prev_mouse = curr_mouse
 
