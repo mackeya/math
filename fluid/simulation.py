@@ -11,7 +11,7 @@ class SimulationConfig:
     dt: float = 0.0003
     init_type: str = 'patterns'
     force_type: str = 'buoyancy' # 'buoyancy', 'torque', or 'radial'
-    bc_type: str = 'periodic'   # 'periodic', 'wall', or 'absorbing'
+    bc_type: str = 'periodic'   # 'periodic', 'wall', 'absorbing', or 'open'
     # 0.0 = no-slip, 1.0 = free-slip (only used when bc_type='wall').  All the action here happens above 0.99
     wall_slip: float = 0.0
 
@@ -86,8 +86,9 @@ class FluidSimulation:
         self.persistent_force_active = False
         self.persistent_force_scale = 0.0
 
-        self.bc_wall = (config.bc_type in ('wall', 'absorbing'))
+        self.bc_wall = (config.bc_type in ('wall', 'absorbing', 'open'))
         self.bc_absorbing = (config.bc_type == 'absorbing')
+        self.bc_open = (config.bc_type == 'open')
 
     @ti.kernel
     def init_patterns(self):
@@ -710,6 +711,32 @@ class FluidSimulation:
             if i == 0 or i == self.res - 1 or j == 0 or j == self.res - 1:
                 self.rho[i, j] = 0.0
 
+    @ti.kernel
+    def apply_open_pressure_bc(self):
+        """
+        Open boundary: Dirichlet p=0 at domain edges (ambient pressure outlet).
+        Applied after each Jacobi step so interior cells see p=0 at boundary neighbors.
+        """
+        for i, j in self.p_temp:
+            if i == 0 or i == self.res - 1 or j == 0 or j == self.res - 1:
+                self.p_temp[i, j] = 0.0
+
+    @ti.kernel
+    def apply_open_dye_bc(self):
+        """
+        Open boundary: zeroes dye at boundary cells where velocity is directed inward.
+        Inflow carries no dye; outflow cells are left alone (zero-gradient via clamping).
+        """
+        for i, j in self.rho:
+            if i == 0 and self.vel[i, j].x > 0:              # left wall, inflow
+                self.rho[i, j] = 0.0
+            if i == self.res - 1 and self.vel[i, j].x < 0:  # right wall, inflow
+                self.rho[i, j] = 0.0
+            if j == 0 and self.vel[i, j].y > 0:              # bottom wall, inflow
+                self.rho[i, j] = 0.0
+            if j == self.res - 1 and self.vel[i, j].y < 0:  # top wall, inflow
+                self.rho[i, j] = 0.0
+
     def step(self):
         """
         Advances the fluid simulation by one time step (Δt) using Operator Splitting.
@@ -752,10 +779,12 @@ class FluidSimulation:
             self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
             self.vel.copy_from(self.new_vel)
 
-        if self.bc_wall:
+        if self.bc_wall and not self.bc_open:
             self.apply_velocity_bc()
         if self.bc_absorbing:
             self.apply_absorbing_rho_bc()
+        elif self.bc_open:
+            self.apply_open_dye_bc()
 
         # Apply external forces (e.g. image gradient or dye gradient)
         if self.force_duration > 0:
@@ -770,7 +799,7 @@ class FluidSimulation:
         if self.persistent_force_active:
             self._apply_persistent_force_kernel(self.persistent_force_scale)
 
-        if self.bc_wall:
+        if self.bc_wall and not self.bc_open:
             self.apply_velocity_bc()
 
         # Projection (Chorin's Projection Method)
@@ -779,9 +808,11 @@ class FluidSimulation:
         # Jacobi iterative solver for Pressure
         for _ in range(100): # Increased iterations for better convergence
             self.pressure_solve_jacobi(self.p, self.p_temp)
+            if self.bc_open:
+                self.apply_open_pressure_bc()
             self.p.copy_from(self.p_temp)
 
         self.pressure_project()
 
-        if self.bc_wall:
+        if self.bc_wall and not self.bc_open:
             self.apply_velocity_bc()
