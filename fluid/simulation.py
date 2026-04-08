@@ -10,6 +10,7 @@ class SimulationConfig:
     res: int = 512
     dt: float = 0.0003
     init_type: str = 'patterns'
+    force_type: str = 'buoyancy' # 'buoyancy' or 'torque'
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
 
@@ -71,6 +72,9 @@ class FluidSimulation:
         self.force_scale = 0.0
         self.dye_force_active = False
 
+        self.persistent_force_active = False
+        self.persistent_force_scale = 0.0
+
     @ti.kernel
     def init_patterns(self):
         """
@@ -81,14 +85,20 @@ class FluidSimulation:
         self.vel.fill(0)
         self.p.fill(0)
         for i, j in self.rho:
-            # Create a grid of dye symmetric around the center
-            if ((i + 16) // 32) % 2 == 0 and ((j + 16) // 32) % 2 == 0:
+            # # Create a grid of dye symmetric around the center
+            # if ((i + 16) // 32) % 2 == 0 and ((j + 16) // 32) % 2 == 0:
+            #     self.rho[i, j] = 1.0
+
+            # Add a central circle
+            dist = (ti.Vector([i * self.dx, j * self.dx]) - ti.Vector([0.5, 0.5])).norm()
+            if dist < 0.1:
                 self.rho[i, j] = 1.0
 
-            # # Add a central circle
-            # dist = (ti.Vector([i * self.dx, j * self.dx]) - ti.Vector([0.5, 0.5])).norm()
-            # if dist < 0.1:
+            # # Sine wave boundary
+            # boundary = self.res / 2 + ti.cos((i * self.dx * 2.0 - 1.0) * np.pi) * self.res * 0.1
+            # if j < boundary:
             #     self.rho[i, j] = 1.0
+
 
     def init_from_image(self, image_path: str):
         """
@@ -160,43 +170,28 @@ class FluidSimulation:
                 self.vel[i, j] += ti.Vector([f_x, f_y]) * self.dt
 
     @ti.kernel
-    def apply_dye_gravity(self, force_strength: float):
+    def _apply_persistent_force_kernel(self, force_strength: float):
         """
-        Applies a downward gravitational force proportional to the dye density.
-        """
-        for i, j in self.vel:
-            self.vel[i, j] += ti.Vector([0.0, -force_strength * self.rho[i, j]]) * self.dt
-
-    @ti.kernel
-    def apply_dye_buoyancy_torque(self, force_strength: float):
-        """
-        Applies a counter-clockwise rotational force proportional to the dye density,
-        centered around the middle of the domain.
+        Applies a persistent force (buoyancy or torque) proportional to the dye density.
         """
         for i, j in self.vel:
-            # Vector from center
-            r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
-            dist = r.norm()
-            if dist > 1e-6:
-                # Counter-clockwise direction: (-dy, dx)
-                force_dir = ti.Vector([-r.y, r.x]) / dist
-                self.vel[i, j] += force_dir * force_strength * self.rho[i, j] * self.dt
+            force = ti.Vector([0.0, 0.0])
+            if ti.static(self.config.force_type == 'buoyancy'):
+                force = ti.Vector([0.0, force_strength * (self.rho[i, j] - 0.5)])
+            elif ti.static(self.config.force_type == 'torque'):
+                # Vector from center
+                r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
+                dist = r.norm()
+                if dist > 1e-6:
+                    # Counter-clockwise direction: (-dy, dx)
+                    force_dir = ti.Vector([-r.y, r.x]) / dist
+                    force = force_dir * force_strength * self.rho[i, j]
 
-    @ti.kernel
-    def apply_dye_buoyancy_radial(self, force_strength: float):
-        """
-        Applies a radial outward force proportional to the dye density,
-        centered around the middle of the domain.
-        """
-        for i, j in self.vel:
-            # Vector from center
-            r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
-            dist = r.norm()
-            if dist > 1e-6:
-                # Radial outward direction
-                force_dir = r / dist
-                self.vel[i, j] += force_dir * force_strength * self.rho[i, j] * self.dt
+            self.vel[i, j] += force * self.dt
 
+    def toggle_persistent_force(self, force_strength: float = 100.0, active: bool = True):
+        self.persistent_force_active = active
+        self.persistent_force_scale = force_strength
 
     def apply_image_gradient_torque(self, image_path: str, scale: float = 1.0, duration: float = 0.1, blur_sigma: float = 0.0):
         """
@@ -647,6 +642,9 @@ class FluidSimulation:
             self.force_duration -= self.dt
         else:
             self.dye_force_active = False
+
+        if self.persistent_force_active:
+            self._apply_persistent_force_kernel(self.persistent_force_scale)
 
         # Projection (Chorin's Projection Method)
         self.compute_divergence()

@@ -5,8 +5,8 @@ from simulation import FluidSimulation, SimulationConfig
 def main():
     config = SimulationConfig()
     config.res = 512
-    config.init_type = 'image'
-    
+    config.init_type = 'patterns' # either image or patterns
+
     sim = FluidSimulation(config)
     if config.init_type == 'patterns':
         sim.init_patterns()
@@ -25,13 +25,14 @@ def main():
     print("  Key 2: WENO-5")
     print("  Key R: Reset Patterns")
     print("  Key F: Apply force to bottom half")
-    print("  Key B: Apply dye gravity (hold)")
+    print("  Key B: Toggle dye gravity (persistent)")
     print("  Key G: Apply image gradient force (gradual)")
     print("  Key D: Apply dye gradient force (gradual/dynamic)")
-    print("  Key V: Apply dye vortex (hold)")
-    print("  Key C: Apply dye radial (hold)")
+    print("  Key V: Toggle dye vortex (persistent)")
 
     prev_mouse = None
+    dye_gravity_on = False
+    dye_vortex_on = False
 
     while gui.running:
         # Handle events
@@ -50,6 +51,16 @@ def main():
                 sim.apply_image_gradient_torque("./lenna.png", scale=1.0, duration=0.1, blur_sigma=1.0)
             elif gui.event.key == 'd':
                 sim.apply_dye_gradient_torque(scale=0.1, duration=0.1)
+            elif gui.event.key == 'b':
+                dye_gravity_on = not dye_gravity_on
+                dye_vortex_on = False
+                sim.config.force_type = 'buoyancy'
+                sim.toggle_persistent_force(3.0, dye_gravity_on)
+            elif gui.event.key == 'v':
+                dye_vortex_on = not dye_vortex_on
+                dye_gravity_on = False
+                sim.config.force_type = 'torque'
+                sim.toggle_persistent_force(3.0, dye_vortex_on)
 
         # Handle mouse interaction
         curr_mouse = gui.get_cursor_pos()
@@ -66,16 +77,6 @@ def main():
 
         if gui.is_pressed('f'):
             sim.apply_bottom_force(1000.0, 200.0)
-
-        if gui.is_pressed('b'):
-            sim.apply_dye_gravity(3000.0)
-
-        if gui.is_pressed('v'):
-            sim.apply_dye_buoyancy_torque(3000.0)
-
-        if gui.is_pressed('c'):
-            # TODO: figure out pressure issues here
-            sim.apply_dye_buoyancy_radial(1000.0)
 
         prev_mouse = curr_mouse
 
