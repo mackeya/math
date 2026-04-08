@@ -189,14 +189,17 @@ class FluidSimulation:
     def _apply_persistent_force_kernel(self, force_strength: float):
         """
         Applies a persistent force (buoyancy or torque) proportional to the dye density.
+        Undecided about whether to make buoyancy relative to density 0.5.
         """
         for i, j in self.vel:
             force = ti.Vector([0.0, 0.0])
             if ti.static(self.config.force_type == 'buoyancy'):
-                force = ti.Vector([0.0, force_strength * (self.rho[i, j] - 0.5)])
+                # force = ti.Vector([0.0, force_strength * (self.rho[i, j] - 0.5)])
+                force = ti.Vector([0.0, force_strength * (self.rho[i, j])])
             elif ti.static(self.config.force_type == 'torque'):
                 # Vector from center
-                r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
+                # r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
+                r = ti.Vector([i * self.dx, j * self.dx])
                 dist = r.norm()
                 if dist > 1e-6:
                     # Counter-clockwise direction: (-dy, dx)
