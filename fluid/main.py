@@ -1,17 +1,19 @@
 import taichi as ti
 import numpy as np
-from simulation import FluidSimulation
+from simulation import FluidSimulation, SimulationConfig
 
 def main():
-    res = 512
-    init_type = 'image'
-    sim = FluidSimulation(res)
-    if init_type == 'patterns':
+    config = SimulationConfig()
+    config.res = 512
+    config.init_type = 'image'
+    
+    sim = FluidSimulation(config)
+    if config.init_type == 'patterns':
         sim.init_patterns()
-    elif init_type == 'image':
+    elif config.init_type == 'image':
         sim.init_from_image("./lenna.png")
 
-    gui = ti.GUI("2D Fluid Simulation Demo", res=(res, res))
+    gui = ti.GUI("2D Fluid Simulation Demo", res=(config.res, config.res))
 
     # Simple UI state
     advection_names = {0: "Semi-Lagrangian", 4: "WENO-5"}
@@ -40,9 +42,9 @@ def main():
                 sim.advection_scheme = 4
             elif gui.event.key == 'r':
                 sim.time = 0.0
-                if init_type == 'patterns':
+                if config.init_type == 'patterns':
                     sim.init_patterns()
-                elif init_type == 'image':
+                elif config.init_type == 'image':
                     sim.init_from_image("./lenna.png")
             elif gui.event.key == 'g':
                 sim.apply_image_gradient_torque("./lenna.png", scale=1.0, duration=0.1, blur_sigma=1.0)

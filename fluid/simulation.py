@@ -1,5 +1,12 @@
 import taichi as ti
 import numpy as np
+from dataclasses import dataclass
+
+@dataclass
+class SimulationConfig:
+    res: int = 512
+    dt: float = 0.0003
+    init_type: str = 'patterns'
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
 
@@ -23,39 +30,40 @@ class FluidSimulation:
     - Step 4. Solve Pressure Poisson Equation: Solve ∇²p = ∇ · u* for pressure 'p'.
     - Step 5. Projection: Subtract the pressure gradient (u -= ∇p) to ensure ∇ · u = 0.
     """
-    def __init__(self, res, dt=0.0003):
-        self.res = res
-        self.dx = 1.0 / res
-        self.dt = dt
+    def __init__(self, config: SimulationConfig):
+        self.config = config
+        self.res = config.res
+        self.dx = 1.0 / self.res
+        self.dt = config.dt
         self.time = 0.0
 
         # Velocity fields (staggered grid or collocated? Let's use collocated for simplicity in demo)
-        self.vel = ti.Vector.field(2, float, shape=(res, res))
-        self.new_vel = ti.Vector.field(2, float, shape=(res, res))
+        self.vel = ti.Vector.field(2, float, shape=(self.res, self.res))
+        self.new_vel = ti.Vector.field(2, float, shape=(self.res, self.res))
 
         # Density/Dye fields
-        self.rho = ti.field(float, shape=(res, res))
-        self.new_rho = ti.field(float, shape=(res, res))
+        self.rho = ti.field(float, shape=(self.res, self.res))
+        self.new_rho = ti.field(float, shape=(self.res, self.res))
 
         # Pressure fields
-        self.p = ti.field(float, shape=(res, res))
-        self.p_temp = ti.field(float, shape=(res, res))
-        self.div = ti.field(float, shape=(res, res))
+        self.p = ti.field(float, shape=(self.res, self.res))
+        self.p_temp = ti.field(float, shape=(self.res, self.res))
+        self.div = ti.field(float, shape=(self.res, self.res))
 
         # Temp pressure field for Jacobi
         self.advection_scheme = 4 # 0: Semi-Lagrangian, 1: Upwind, 2: MacCormack, 3: TVD, 4: WENO5
 
         # RK3 intermediate fields
-        self.rho_1 = ti.field(float, shape=(res, res))
-        self.rho_2 = ti.field(float, shape=(res, res))
-        self.dq_rho = ti.field(float, shape=(res, res))
+        self.rho_1 = ti.field(float, shape=(self.res, self.res))
+        self.rho_2 = ti.field(float, shape=(self.res, self.res))
+        self.dq_rho = ti.field(float, shape=(self.res, self.res))
 
-        self.vel_1 = ti.Vector.field(2, float, shape=(res, res))
-        self.vel_2 = ti.Vector.field(2, float, shape=(res, res))
-        self.dq_vel = ti.Vector.field(2, float, shape=(res, res))
+        self.vel_1 = ti.Vector.field(2, float, shape=(self.res, self.res))
+        self.vel_2 = ti.Vector.field(2, float, shape=(self.res, self.res))
+        self.dq_vel = ti.Vector.field(2, float, shape=(self.res, self.res))
 
         # Gradual force application
-        self.image_grad = ti.Vector.field(2, float, shape=(res, res))
+        self.image_grad = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.force_duration = 0.0
         self.force_scale = 0.0
         self.dye_force_active = False
