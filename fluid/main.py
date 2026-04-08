@@ -34,10 +34,12 @@ def main():
     print("  Key G: Apply image gradient force (gradual)")
     print("  Key D: Apply dye gradient force (gradual/dynamic)")
     print("  Key V: Toggle dye vortex (persistent)")
+    print("  Key C: Toggle dye radial (persistent)")
 
     prev_mouse = None
     dye_gravity_on = False
     dye_vortex_on = False
+    dye_radial_on = False
 
     while gui.running:
         # Handle events
@@ -59,13 +61,21 @@ def main():
             elif gui.event.key == 'b':
                 dye_gravity_on = not dye_gravity_on
                 dye_vortex_on = False
+                dye_radial_on = False
                 sim.config.force_type = 'buoyancy'
                 sim.toggle_persistent_force(3.0, dye_gravity_on)
             elif gui.event.key == 'v':
                 dye_vortex_on = not dye_vortex_on
                 dye_gravity_on = False
+                dye_radial_on = False
                 sim.config.force_type = 'torque'
                 sim.toggle_persistent_force(3.0, dye_vortex_on)
+            elif gui.event.key == 'c':
+                dye_radial_on = not dye_radial_on
+                dye_gravity_on = False
+                dye_vortex_on = False
+                sim.config.force_type = 'radial'
+                sim.toggle_persistent_force(3.0, dye_radial_on)
 
         # Handle mouse interaction
         curr_mouse = gui.get_cursor_pos()

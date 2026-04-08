@@ -10,7 +10,7 @@ class SimulationConfig:
     res: int = 512
     dt: float = 0.0003
     init_type: str = 'patterns'
-    force_type: str = 'buoyancy' # 'buoyancy' or 'torque'
+    force_type: str = 'buoyancy' # 'buoyancy', 'torque', or 'radial'
     bc_type: str = 'periodic'   # 'periodic' or 'wall'
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
@@ -198,13 +198,24 @@ class FluidSimulation:
                 force = ti.Vector([0.0, force_strength * (self.rho[i, j])])
             elif ti.static(self.config.force_type == 'torque'):
                 # Vector from center
-                # r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
-                r = ti.Vector([i * self.dx, j * self.dx])
+                r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
                 dist = r.norm()
                 if dist > 1e-6:
                     # Counter-clockwise direction: (-dy, dx)
                     force_dir = ti.Vector([-r.y, r.x]) / dist
                     force = force_dir * force_strength * self.rho[i, j]
+            elif ti.static(self.config.force_type == 'radial'):
+                # Vector from center
+                r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
+                dist = r.norm()
+                if dist > 1e-6:
+                    # Outward radial force with constant magnitude
+                    force = (r / (dist + 0.1)) * force_strength * self.rho[i, j]
+                # Boundary mask to avoid pressure buildup at edges (outer 20%)
+                dist_x = ti.min(i * self.dx, 1.0 - i * self.dx)
+                dist_y = ti.min(j * self.dx, 1.0 - j * self.dx)
+                # mask = ti.math.smoothstep(0.0, 0.2, ti.min(dist_x, dist_y))
+                # force *= mask
 
             self.vel[i, j] += force * self.dt
 
