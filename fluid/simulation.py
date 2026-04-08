@@ -11,6 +11,7 @@ class SimulationConfig:
     dt: float = 0.0003
     init_type: str = 'patterns'
     force_type: str = 'buoyancy' # 'buoyancy' or 'torque'
+    bc_type: str = 'periodic'   # 'periodic' or 'wall'
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
 
@@ -34,7 +35,15 @@ class FluidSimulation:
     - Step 4. Solve Pressure Poisson Equation: Solve ∇²p = ∇ · u* for pressure 'p'.
     - Step 5. Projection: Subtract the pressure gradient (u -= ∇p) to ensure ∇ · u = 0.
     """
-    def __init__(self, config: SimulationConfig):
+    def __init__(self, config_or_res=None, dt: float = None, **kwargs):
+        if isinstance(config_or_res, int):
+            config = SimulationConfig(res=config_or_res)
+            if dt is not None:
+                config.dt = dt
+        elif config_or_res is None:
+            config = SimulationConfig(**kwargs)
+        else:
+            config = config_or_res
         self.config = config
         self.res = config.res
         self.dx = 1.0 / self.res
@@ -75,6 +84,8 @@ class FluidSimulation:
         self.persistent_force_active = False
         self.persistent_force_scale = 0.0
 
+        self.bc_wall = (config.bc_type == 'wall')
+
     @ti.kernel
     def init_patterns(self):
         """
@@ -85,19 +96,19 @@ class FluidSimulation:
         self.vel.fill(0)
         self.p.fill(0)
         for i, j in self.rho:
-            # Create a grid of dye symmetric around the center
-            if ((i + 16) // 32) % 2 == 0 and ((j + 16) // 32) % 2 == 0:
-                self.rho[i, j] = 1.0
+            # # Create a grid of dye symmetric around the center
+            # if ((i + 16) // 32) % 2 == 0 and ((j + 16) // 32) % 2 == 0:
+            #     self.rho[i, j] = 1.0
 
             # # Add a central circle
             # dist = (ti.Vector([i * self.dx, j * self.dx]) - ti.Vector([0.5, 0.5])).norm()
             # if dist < 0.1:
             #     self.rho[i, j] = 1.0
 
-            # # Sine wave boundary
-            # boundary = self.res / 2 + ti.cos((i * self.dx * 2.0 - 1.0) * np.pi) * self.res * 0.1
-            # if j < boundary:
-            #     self.rho[i, j] = 1.0
+            # Sine wave boundary
+            boundary = self.res / 2 + ti.cos((i * self.dx * 2.0 - 1.0) * np.pi) * self.res * 0.1
+            if j < boundary:
+                self.rho[i, j] = 1.0
 
 
     def init_from_image(self, image_path: str):
@@ -135,12 +146,14 @@ class FluidSimulation:
         Equation: ρ(x, y) = ρ(x, y) + amount (for points within the specified radius)
         """
         for i, j in self.rho:
-            dx = abs(i * self.dx - x)
-            dy = abs(j * self.dx - y)
-            # Periodic distance
-            if dx > 0.5: dx = 1.0 - dx
-            if dy > 0.5: dy = 1.0 - dy
-            dist = ti.sqrt(dx*dx + dy*dy)
+            dist_x = abs(i * self.dx - x)
+            dist_y = abs(j * self.dx - y)
+            if dist_x > 0.5: dist_x = 1.0 - dist_x
+            if dist_y > 0.5: dist_y = 1.0 - dist_y
+            if ti.static(self.bc_wall):
+                dist_x = i * self.dx - x
+                dist_y = j * self.dx - y
+            dist = ti.sqrt(dist_x * dist_x + dist_y * dist_y)
             if dist < radius:
                 self.rho[i, j] += amount
 
@@ -152,11 +165,14 @@ class FluidSimulation:
         u(t + Δt) = u(t) + f * Δt
         """
         for i, j in self.vel:
-            dx = abs(i * self.dx - x)
-            dy = abs(j * self.dx - y)
-            if dx > 0.5: dx = 1.0 - dx
-            if dy > 0.5: dy = 1.0 - dy
-            dist = ti.sqrt(dx*dx + dy*dy)
+            dist_x = abs(i * self.dx - x)
+            dist_y = abs(j * self.dx - y)
+            if dist_x > 0.5: dist_x = 1.0 - dist_x
+            if dist_y > 0.5: dist_y = 1.0 - dist_y
+            if ti.static(self.bc_wall):
+                dist_x = i * self.dx - x
+                dist_y = j * self.dx - y
+            dist = ti.sqrt(dist_x * dist_x + dist_y * dist_y)
             if dist < radius:
                 self.vel[i, j] += ti.Vector([f_x, f_y]) * self.dt
 
@@ -256,6 +272,11 @@ class FluidSimulation:
             ip1 = (i + 1) % self.res
             jm1 = (j - 1) % self.res
             jp1 = (j + 1) % self.res
+            if ti.static(self.bc_wall):
+                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
+                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
 
             grad_x = (img[ip1, j] - img[im1, j]) * 0.5 / self.dx
             grad_y = (img[i, jp1] - img[i, jm1]) * 0.5 / self.dx
@@ -269,6 +290,11 @@ class FluidSimulation:
             ip1 = (i + 1) % self.res
             jm1 = (j - 1) % self.res
             jp1 = (j + 1) % self.res
+            if ti.static(self.bc_wall):
+                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
+                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
 
             grad_x = (x[ip1, j] - x[im1, j]) * 0.5 / self.dx
             grad_y = (x[i, jp1] - x[i, jm1]) * 0.5 / self.dx
@@ -284,15 +310,18 @@ class FluidSimulation:
     def sample(self, q, u, v):
         """
         Samples a field `q` at a fractional coordinate (u, v) using bilinear interpolation.
-        Applies periodic boundary conditions for coordinates out of bounds.
         """
-        # Bi-linear interpolation with periodic boundaries
         i, j = int(ti.floor(u)), int(ti.floor(v))
         f, g = u - i, v - j
 
-        # Periodic wrap-around for indices
+        # Default: periodic wrap. Wall: clamp-to-edge (zero-flux Neumann).
         i0, j0 = i % self.res, j % self.res
         i1, j1 = (i + 1) % self.res, (j + 1) % self.res
+        if ti.static(self.bc_wall):
+            i0 = ti.math.clamp(i,     0, self.res - 1)
+            i1 = ti.math.clamp(i + 1, 0, self.res - 1)
+            j0 = ti.math.clamp(j,     0, self.res - 1)
+            j1 = ti.math.clamp(j + 1, 0, self.res - 1)
 
         return (1 - f) * (1 - g) * q[i0, j0] + \
                f * (1 - g) * q[i1, j0] + \
@@ -332,11 +361,15 @@ class FluidSimulation:
         for i, j in field:
             u = self.vel[i, j]
             val = field[i, j]
-            # Wrap around neighbors
             im1 = (i - 1) % self.res
             ip1 = (i + 1) % self.res
             jm1 = (j - 1) % self.res
             jp1 = (j + 1) % self.res
+            if ti.static(self.bc_wall):
+                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
+                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
 
             if u.x > 0:
                 val -= (self.dt / self.dx) * u.x * (field[i, j] - field[im1, j])
@@ -358,12 +391,14 @@ class FluidSimulation:
         Mathematical detail:
         q^*_{i,j} = q^n_{i,j} - Δt/dx * [u * (q^n_{i+1,j} - q^n_{i,j}) + v * (q^n_{i,j+1} - q^n_{i,j})]
         """
-        # Predictor with wrapping
         for i, j in field:
             u = self.vel[i, j]
             val = field[i, j]
             ip1 = (i + 1) % self.res
             jp1 = (j + 1) % self.res
+            if ti.static(self.bc_wall):
+                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
             val -= (self.dt / self.dx) * (u.x * (field[ip1, j] - field[i, j]) + u.y * (field[i, jp1] - field[i, j]))
             temp_field[i, j] = val
 
@@ -381,6 +416,9 @@ class FluidSimulation:
             u = self.vel[i, j]
             im1 = (i - 1) % self.res
             jm1 = (j - 1) % self.res
+            if ti.static(self.bc_wall):
+                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
             val_corr = temp_field[i, j] - (self.dt / self.dx) * (u.x * (temp_field[i, j] - temp_field[im1, j]) + u.y * (temp_field[i, j] - temp_field[i, jm1]))
             new_field[i, j] = 0.5 * (field[i, j] + val_corr)
 
@@ -398,11 +436,26 @@ class FluidSimulation:
             u = self.vel[i, j]
             val = field[i, j]
 
+            im2 = (i - 2) % self.res
+            im1 = (i - 1) % self.res
+            ip1 = (i + 1) % self.res
+            ip2 = (i + 2) % self.res
+            jm2 = (j - 2) % self.res
+            jm1 = (j - 1) % self.res
+            jp1 = (j + 1) % self.res
+            jp2 = (j + 2) % self.res
+            if ti.static(self.bc_wall):
+                im2 = ti.math.clamp(i - 2, 0, self.res - 1)
+                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+                ip2 = ti.math.clamp(i + 2, 0, self.res - 1)
+                jm2 = ti.math.clamp(j - 2, 0, self.res - 1)
+                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
+                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
+                jp2 = ti.math.clamp(j + 2, 0, self.res - 1)
+
             # x direction flux difference
             if u.x > 0:
-                im1 = (i - 1) % self.res
-                im2 = (i - 2) % self.res
-                ip1 = (i + 1) % self.res
                 c = u.x * self.dt / self.dx
                 dq_i_plus_half = field[ip1, j] - field[i, j]
                 dq_i_minus_half = field[i, j] - field[im1, j]
@@ -411,9 +464,6 @@ class FluidSimulation:
                 flux_l = u.x * field[im1, j] + 0.5 * u.x * (1.0 - c) * self.minmod(dq_i_minus_half, dq_i_minus_3_half)
                 val -= (self.dt / self.dx) * (flux_r - flux_l)
             else:
-                ip1 = (i + 1) % self.res
-                ip2 = (i + 2) % self.res
-                im1 = (i - 1) % self.res
                 c = -u.x * self.dt / self.dx
                 dq_i_minus_half = field[i, j] - field[im1, j]
                 dq_i_plus_half = field[ip1, j] - field[i, j]
@@ -424,9 +474,6 @@ class FluidSimulation:
 
             # y direction flux difference
             if u.y > 0:
-                jm1 = (j - 1) % self.res
-                jm2 = (j - 2) % self.res
-                jp1 = (j + 1) % self.res
                 c = u.y * self.dt / self.dx
                 dq_j_plus_half = field[i, jp1] - field[i, j]
                 dq_j_minus_half = field[i, j] - field[i, jm1]
@@ -435,9 +482,6 @@ class FluidSimulation:
                 flux_b = u.y * field[i, jm1] + 0.5 * u.y * (1.0 - c) * self.minmod(dq_j_minus_half, dq_j_minus_3_half)
                 val -= (self.dt / self.dx) * (flux_t - flux_b)
             else:
-                jp1 = (j + 1) % self.res
-                jp2 = (j + 2) % self.res
-                jm1 = (j - 1) % self.res
                 c = -u.y * self.dt / self.dx
                 dq_j_minus_half = field[i, j] - field[i, jm1]
                 dq_j_plus_half = field[i, jp1] - field[i, j]
@@ -471,13 +515,34 @@ class FluidSimulation:
             flux_x = field[i, j] * 0.0
             flux_y = field[i, j] * 0.0
 
-            # x flux
+            # Neighbor indices: default periodic, overridden to clamp for wall BC
             im3 = (i - 3) % self.res
             im2 = (i - 2) % self.res
             im1 = (i - 1) % self.res
             ip1 = (i + 1) % self.res
             ip2 = (i + 2) % self.res
             ip3 = (i + 3) % self.res
+            jm3 = (j - 3) % self.res
+            jm2 = (j - 2) % self.res
+            jm1 = (j - 1) % self.res
+            jp1 = (j + 1) % self.res
+            jp2 = (j + 2) % self.res
+            jp3 = (j + 3) % self.res
+            if ti.static(self.bc_wall):
+                im3 = ti.math.clamp(i - 3, 0, self.res - 1)
+                im2 = ti.math.clamp(i - 2, 0, self.res - 1)
+                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+                ip2 = ti.math.clamp(i + 2, 0, self.res - 1)
+                ip3 = ti.math.clamp(i + 3, 0, self.res - 1)
+                jm3 = ti.math.clamp(j - 3, 0, self.res - 1)
+                jm2 = ti.math.clamp(j - 2, 0, self.res - 1)
+                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
+                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
+                jp2 = ti.math.clamp(j + 2, 0, self.res - 1)
+                jp3 = ti.math.clamp(j + 3, 0, self.res - 1)
+
+            # x flux
             if u.x > 0:
                 q_R = self.weno5_reconstruct(field[im2, j], field[im1, j], field[i, j], field[ip1, j], field[ip2, j])
                 q_L = self.weno5_reconstruct(field[im3, j], field[im2, j], field[im1, j], field[i, j], field[ip1, j])
@@ -488,12 +553,6 @@ class FluidSimulation:
                 flux_x = u.x * (q_R - q_L)
 
             # y flux
-            jm3 = (j - 3) % self.res
-            jm2 = (j - 2) % self.res
-            jm1 = (j - 1) % self.res
-            jp1 = (j + 1) % self.res
-            jp2 = (j + 2) % self.res
-            jp3 = (j + 3) % self.res
             if u.y > 0:
                 q_T = self.weno5_reconstruct(field[i, jm2], field[i, jm1], field[i, j], field[i, jp1], field[i, jp2])
                 q_B = self.weno5_reconstruct(field[i, jm3], field[i, jm2], field[i, jm1], field[i, j], field[i, jp1])
@@ -545,6 +604,11 @@ class FluidSimulation:
             vr = self.vel[(i + 1) % self.res, j].x
             vb = self.vel[i, (j - 1) % self.res].y
             vt = self.vel[i, (j + 1) % self.res].y
+            if ti.static(self.bc_wall):
+                vl = self.vel[ti.math.clamp(i - 1, 0, self.res - 1), j].x
+                vr = self.vel[ti.math.clamp(i + 1, 0, self.res - 1), j].x
+                vb = self.vel[i, ti.math.clamp(j - 1, 0, self.res - 1)].y
+                vt = self.vel[i, ti.math.clamp(j + 1, 0, self.res - 1)].y
             self.div[i, j] = (vr - vl + vt - vb) * 0.5 / self.dx
 
     @ti.kernel
@@ -563,12 +627,17 @@ class FluidSimulation:
         Rearranging for p_{i,j} gives the Jacobi iteration step:
         p_{i,j}^{(k+1)} = 0.25 * [ p_{i+1,j}^{(k)} + p_{i-1,j}^{(k)} + p_{i,j+1}^{(k)} + p_{i,j-1}^{(k)} - dx² * (∇ · u*)_{i,j} ]
         """
-        # One iteration of Jacobi with wrapping
         for i, j in p:
             pl = p[(i - 1) % self.res, j]
             pr = p[(i + 1) % self.res, j]
             pb = p[i, (j - 1) % self.res]
             pt = p[i, (j + 1) % self.res]
+            if ti.static(self.bc_wall):
+                # Neumann BC: ghost cell = self (∂p/∂n = 0)
+                pl = p[ti.math.clamp(i - 1, 0, self.res - 1), j]
+                pr = p[ti.math.clamp(i + 1, 0, self.res - 1), j]
+                pb = p[i, ti.math.clamp(j - 1, 0, self.res - 1)]
+                pt = p[i, ti.math.clamp(j + 1, 0, self.res - 1)]
             new_p[i, j] = (pl + pr + pb + pt - self.div[i, j] * self.dx * self.dx) * 0.25
 
     @ti.kernel
@@ -588,8 +657,23 @@ class FluidSimulation:
             pr = self.p[(i + 1) % self.res, j]
             pb = self.p[i, (j - 1) % self.res]
             pt = self.p[i, (j + 1) % self.res]
+            if ti.static(self.bc_wall):
+                pl = self.p[ti.math.clamp(i - 1, 0, self.res - 1), j]
+                pr = self.p[ti.math.clamp(i + 1, 0, self.res - 1), j]
+                pb = self.p[i, ti.math.clamp(j - 1, 0, self.res - 1)]
+                pt = self.p[i, ti.math.clamp(j + 1, 0, self.res - 1)]
             grad_p = ti.Vector([(pr - pl) * 0.5 / self.dx, (pt - pb) * 0.5 / self.dx])
             self.vel[i, j] -= grad_p
+
+    @ti.kernel
+    def apply_velocity_bc(self):
+        """
+        Enforces no-slip (zero-velocity) boundary conditions on the four walls.
+        Only called when bc_type == 'wall'.
+        """
+        for i, j in self.vel:
+            if i == 0 or i == self.res - 1 or j == 0 or j == self.res - 1:
+                self.vel[i, j] = ti.Vector([0.0, 0.0])
 
     def step(self):
         """
@@ -633,6 +717,9 @@ class FluidSimulation:
             self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
             self.vel.copy_from(self.new_vel)
 
+        if self.bc_wall:
+            self.apply_velocity_bc()
+
         # Apply external forces (e.g. image gradient or dye gradient)
         if self.force_duration > 0:
             if self.dye_force_active:
@@ -646,6 +733,9 @@ class FluidSimulation:
         if self.persistent_force_active:
             self._apply_persistent_force_kernel(self.persistent_force_scale)
 
+        if self.bc_wall:
+            self.apply_velocity_bc()
+
         # Projection (Chorin's Projection Method)
         self.compute_divergence()
 
@@ -655,3 +745,6 @@ class FluidSimulation:
             self.p.copy_from(self.p_temp)
 
         self.pressure_project()
+
+        if self.bc_wall:
+            self.apply_velocity_bc()

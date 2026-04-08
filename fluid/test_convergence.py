@@ -74,10 +74,10 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
             sim.advect_maccormack_step1(sim.rho, sim.new_rho)
             sim.advect_maccormack_step2(sim.rho, sim.new_rho, sim.rho)
         elif sim.advection_scheme == 3:
-            sim.advect_tvd_scalar(sim.rho, sim.new_rho)
+            sim.advect_tvd(sim.rho, sim.new_rho)
             sim.rho.copy_from(sim.new_rho)
         elif sim.advection_scheme == 4:
-            sim.step_weno(sim.rho, sim.rho_1, sim.rho_2, sim.new_rho, sim.dq_rho, False)
+            sim.step_weno(sim.rho, sim.rho_1, sim.rho_2, sim.new_rho, sim.dq_rho)
             sim.rho.copy_from(sim.new_rho)
 
     # Compute error
