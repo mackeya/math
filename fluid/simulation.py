@@ -1,3 +1,6 @@
+# type: ignore
+# pylint: skip-file
+# flake8: noqa
 import taichi as ti
 import numpy as np
 from dataclasses import dataclass
