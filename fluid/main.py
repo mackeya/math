@@ -8,9 +8,10 @@ def main():
     # Dye initialization
     config.init_type = 'patterns'
     # config.init_type = 'image'
-    # Boundary conditions: 'periodic' or 'wall'
-    config.bc_type = 'wall'
-    config.wall_slip = 0.999  # 0.0 = no-slip, 1.0 = free-slip
+    # Boundary conditions: 'periodic', 'wall', or 'absorbing'
+    config.bc_type = 'absorbing'
+    config.wall_slip = 0.0  # 0.0 = no-slip, 1.0 = free-slip (wall and absorbing)
+    # config.bc_type = 'wall'
     # config.bc_type = 'periodic'
 
     sim = FluidSimulation(config)
@@ -109,7 +110,7 @@ def main():
         gui.text(f"Scheme: {advection_names[sim.advection_scheme]}", pos=(0.05, 0.95), color=0xFFFFFF)
         gui.text(f"Time: {sim.time:.2f}s", pos=(0.05, 0.90), color=0xFFFFFF)
         gui.text(f"dt: {sim.dt}, substeps: {substeps}", pos=(0.05, 0.85), color=0xFFFFFF)
-        bc_label = config.bc_type if config.bc_type == 'periodic' else f"wall (slip={config.wall_slip:.1f})"
+        bc_label = config.bc_type if config.bc_type == 'periodic' else f"{config.bc_type} (slip={config.wall_slip:.1f})"
         gui.text(f"BC: {bc_label}", pos=(0.05, 0.80), color=0xFFFFFF)
 
         gui.show()

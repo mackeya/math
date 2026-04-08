@@ -11,7 +11,7 @@ class SimulationConfig:
     dt: float = 0.0003
     init_type: str = 'patterns'
     force_type: str = 'buoyancy' # 'buoyancy', 'torque', or 'radial'
-    bc_type: str = 'periodic'   # 'periodic' or 'wall'
+    bc_type: str = 'periodic'   # 'periodic', 'wall', or 'absorbing'
     # 0.0 = no-slip, 1.0 = free-slip (only used when bc_type='wall').  All the action here happens above 0.99
     wall_slip: float = 0.0
 
@@ -86,7 +86,8 @@ class FluidSimulation:
         self.persistent_force_active = False
         self.persistent_force_scale = 0.0
 
-        self.bc_wall = (config.bc_type == 'wall')
+        self.bc_wall = (config.bc_type in ('wall', 'absorbing'))
+        self.bc_absorbing = (config.bc_type == 'absorbing')
 
     @ti.kernel
     def init_patterns(self):
@@ -140,6 +141,8 @@ class FluidSimulation:
 
         # Transfer NumPy data to the Taichi field
         self.rho.from_numpy(dye_np)
+        if self.bc_absorbing:
+            self.apply_absorbing_rho_bc()
 
     @ti.kernel
     def fill_dye(self, x: float, y: float, radius: float, amount: float):
@@ -697,6 +700,16 @@ class FluidSimulation:
                 self.vel[i, j].y = 0.0
                 self.vel[i, j].x *= self.config.wall_slip
 
+    @ti.kernel
+    def apply_absorbing_rho_bc(self):
+        """
+        Absorbing boundary: zeroes the boundary rows/columns of the dye field.
+        Dye that reaches the wall is removed rather than reflected or accumulated.
+        """
+        for i, j in self.rho:
+            if i == 0 or i == self.res - 1 or j == 0 or j == self.res - 1:
+                self.rho[i, j] = 0.0
+
     def step(self):
         """
         Advances the fluid simulation by one time step (Δt) using Operator Splitting.
@@ -741,6 +754,8 @@ class FluidSimulation:
 
         if self.bc_wall:
             self.apply_velocity_bc()
+        if self.bc_absorbing:
+            self.apply_absorbing_rho_bc()
 
         # Apply external forces (e.g. image gradient or dye gradient)
         if self.force_duration > 0:
