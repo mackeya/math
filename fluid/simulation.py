@@ -85,14 +85,14 @@ class FluidSimulation:
         self.vel.fill(0)
         self.p.fill(0)
         for i, j in self.rho:
-            # # Create a grid of dye symmetric around the center
-            # if ((i + 16) // 32) % 2 == 0 and ((j + 16) // 32) % 2 == 0:
-            #     self.rho[i, j] = 1.0
-
-            # Add a central circle
-            dist = (ti.Vector([i * self.dx, j * self.dx]) - ti.Vector([0.5, 0.5])).norm()
-            if dist < 0.1:
+            # Create a grid of dye symmetric around the center
+            if ((i + 16) // 32) % 2 == 0 and ((j + 16) // 32) % 2 == 0:
                 self.rho[i, j] = 1.0
+
+            # # Add a central circle
+            # dist = (ti.Vector([i * self.dx, j * self.dx]) - ti.Vector([0.5, 0.5])).norm()
+            # if dist < 0.1:
+            #     self.rho[i, j] = 1.0
 
             # # Sine wave boundary
             # boundary = self.res / 2 + ti.cos((i * self.dx * 2.0 - 1.0) * np.pi) * self.res * 0.1

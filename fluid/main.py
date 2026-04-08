@@ -5,7 +5,8 @@ from simulation import FluidSimulation, SimulationConfig
 def main():
     config = SimulationConfig()
     config.res = 512
-    config.init_type = 'patterns' # either image or patterns
+    config.init_type = 'patterns'
+    config.init_type = 'image'
 
     sim = FluidSimulation(config)
     if config.init_type == 'patterns':
