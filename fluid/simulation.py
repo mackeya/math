@@ -12,6 +12,8 @@ class SimulationConfig:
     init_type: str = 'patterns'
     force_type: str = 'buoyancy' # 'buoyancy', 'torque', or 'radial'
     bc_type: str = 'periodic'   # 'periodic' or 'wall'
+    # 0.0 = no-slip, 1.0 = free-slip (only used when bc_type='wall').  All the action here happens above 0.99
+    wall_slip: float = 0.0
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
 
@@ -96,19 +98,19 @@ class FluidSimulation:
         self.vel.fill(0)
         self.p.fill(0)
         for i, j in self.rho:
-            # # Create a grid of dye symmetric around the center
-            # if ((i + 16) // 32) % 2 == 0 and ((j + 16) // 32) % 2 == 0:
-            #     self.rho[i, j] = 1.0
+            # Create a grid of dye symmetric around the center
+            if ((i + 16) // 32) % 2 == 0 and ((j + 16) // 32) % 2 == 0:
+                self.rho[i, j] = 1.0
 
             # # Add a central circle
             # dist = (ti.Vector([i * self.dx, j * self.dx]) - ti.Vector([0.5, 0.5])).norm()
             # if dist < 0.1:
             #     self.rho[i, j] = 1.0
 
-            # Sine wave boundary
-            boundary = self.res / 2 + ti.cos((i * self.dx * 2.0 - 1.0) * np.pi) * self.res * 0.1
-            if j < boundary:
-                self.rho[i, j] = 1.0
+            # # Sine wave boundary
+            # boundary = self.res / 2 + ti.cos((i * self.dx * 2.0 - 1.0) * np.pi) * self.res * 0.1
+            # if j < boundary:
+            #     self.rho[i, j] = 1.0
 
 
     def init_from_image(self, image_path: str):
@@ -682,12 +684,18 @@ class FluidSimulation:
     @ti.kernel
     def apply_velocity_bc(self):
         """
-        Enforces no-slip (zero-velocity) boundary conditions on the four walls.
-        Only called when bc_type == 'wall'.
+        Enforces wall boundary conditions.
+        Normal component is always zeroed. Tangential component is multiplied by
+        wall_slip: 0.0 = no-slip (tangential zeroed), 1.0 = free-slip (tangential unchanged).
+        Corners always get both components zeroed regardless of wall_slip.
         """
         for i, j in self.vel:
-            if i == 0 or i == self.res - 1 or j == 0 or j == self.res - 1:
-                self.vel[i, j] = ti.Vector([0.0, 0.0])
+            if i == 0 or i == self.res - 1:
+                self.vel[i, j].x = 0.0
+                self.vel[i, j].y *= self.config.wall_slip
+            if j == 0 or j == self.res - 1:
+                self.vel[i, j].y = 0.0
+                self.vel[i, j].x *= self.config.wall_slip
 
     def step(self):
         """
