@@ -1,3 +1,5 @@
+# type: ignore
+# pylint: skip-file
 import taichi as ti
 import numpy as np
 import time
