@@ -7,7 +7,7 @@ def main():
     config.res = 512
     # Dye initialization
     config.init_type = 'patterns'
-    # config.init_type = 'image'
+    config.init_type = 'image'
     # Boundary conditions: 'periodic', 'wall', 'absorbing', or 'open'
     config.bc_type = 'open'
     # config.bc_type = 'absorbing'
@@ -39,9 +39,7 @@ def main():
     print("  Key C: Toggle dye radial (persistent)")
 
     prev_mouse = None
-    dye_gravity_on = False
-    dye_vortex_on = False
-    dye_radial_on = False
+    DEFAULT_FORCE = 3.0  # default coefficient strength when toggling a force on
 
     while gui.running:
         # Handle events
@@ -61,23 +59,23 @@ def main():
             elif gui.event.key == 'd':
                 sim.apply_dye_gradient_torque(scale=0.1, duration=0.1)
             elif gui.event.key == 'b':
-                dye_gravity_on = not dye_gravity_on
-                dye_vortex_on = False
-                dye_radial_on = False
-                sim.config.force_type = 'buoyancy'
-                sim.toggle_persistent_force(3.0, dye_gravity_on)
+                # Toggle buoyancy: set coefficient to default or zero it off
+                if sim.config.buoyancy_coeff < 1.0:
+                    sim.config.buoyancy_coeff = DEFAULT_FORCE
+                else:
+                    sim.config.buoyancy_coeff = 0.0
             elif gui.event.key == 'v':
-                dye_vortex_on = not dye_vortex_on
-                dye_gravity_on = False
-                dye_radial_on = False
-                sim.config.force_type = 'torque'
-                sim.toggle_persistent_force(3.0, dye_vortex_on)
+                # Toggle torque
+                if sim.config.torque_coeff < 1.0:
+                    sim.config.torque_coeff = DEFAULT_FORCE
+                else:
+                    sim.config.torque_coeff = 0.0
             elif gui.event.key == 'c':
-                dye_radial_on = not dye_radial_on
-                dye_gravity_on = False
-                dye_vortex_on = False
-                sim.config.force_type = 'radial'
-                sim.toggle_persistent_force(3.0, dye_radial_on)
+                # Toggle radial
+                if sim.config.radial_coeff < 1.0:
+                    sim.config.radial_coeff = DEFAULT_FORCE
+                else:
+                    sim.config.radial_coeff = 0.0
 
         # Handle mouse interaction
         curr_mouse = gui.get_cursor_pos()

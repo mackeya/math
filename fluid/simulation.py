@@ -10,7 +10,11 @@ class SimulationConfig:
     res: int = 512
     dt: float = 0.0003
     init_type: str = 'patterns'
-    force_type: str = 'buoyancy' # 'buoyancy', 'torque', or 'radial'
+    # Persistent force coefficients. Set to non-zero to enable each force.
+    # Forces are additive and can be blended freely.
+    buoyancy_coeff: float = 0.0   # upward buoyancy proportional to dye density
+    torque_coeff: float = 0.0     # counter-clockwise tangential force
+    radial_coeff: float = 0.0     # outward radial force
     bc_type: str = 'periodic'   # 'periodic', 'wall', 'absorbing', or 'open'
     # 0.0 = no-slip, 1.0 = free-slip (only used when bc_type='wall').  All the action here happens above 0.99
     wall_slip: float = 0.0
@@ -66,7 +70,7 @@ class FluidSimulation:
         self.div = ti.field(float, shape=(self.res, self.res))
 
         # Temp pressure field for Jacobi
-        self.advection_scheme = 4 # 0: Semi-Lagrangian, 1: Upwind, 2: MacCormack, 3: TVD, 4: WENO5
+        self.advection_scheme = 4 # 0: Semi-Lagrangian, 2: MacCormack, 4: WENO5
 
         # RK3 intermediate fields
         self.rho_1 = ti.field(float, shape=(self.res, self.res))
@@ -82,9 +86,6 @@ class FluidSimulation:
         self.force_duration = 0.0
         self.force_scale = 0.0
         self.dye_force_active = False
-
-        self.persistent_force_active = False
-        self.persistent_force_scale = 0.0
 
         self.bc_wall = (config.bc_type in ('wall', 'absorbing', 'open'))
         self.bc_absorbing = (config.bc_type == 'absorbing')
@@ -192,42 +193,32 @@ class FluidSimulation:
                 self.vel[i, j] += ti.Vector([f_x, f_y]) * self.dt
 
     @ti.kernel
-    def _apply_persistent_force_kernel(self, force_strength: float):
+    def _apply_persistent_force_kernel(self, b_coeff: float, t_coeff: float, r_coeff: float):
         """
-        Applies a persistent force (buoyancy or torque) proportional to the dye density.
-        Undecided about whether to make buoyancy relative to density 0.5.
+        Applies persistent forces proportional to the dye density.
+        Values are passed as arguments to ensure reactivity in Taichi.
+        Forces are additive.
         """
         for i, j in self.vel:
             force = ti.Vector([0.0, 0.0])
-            if ti.static(self.config.force_type == 'buoyancy'):
-                # force = ti.Vector([0.0, force_strength * (self.rho[i, j] - 0.5)])
-                force = ti.Vector([0.0, force_strength * (self.rho[i, j])])
-            elif ti.static(self.config.force_type == 'torque'):
-                # Vector from center
-                r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
-                dist = r.norm()
-                if dist > 1e-6:
-                    # Counter-clockwise direction: (-dy, dx)
-                    force_dir = ti.Vector([-r.y, r.x]) / dist
-                    force = force_dir * force_strength * self.rho[i, j]
-            elif ti.static(self.config.force_type == 'radial'):
-                # Vector from center
-                r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
-                dist = r.norm()
-                if dist > 1e-6:
-                    # Outward radial force with constant magnitude
-                    force = (r / (dist + 0.1)) * force_strength * self.rho[i, j]
-                # Boundary mask to avoid pressure buildup at edges (outer 20%)
-                dist_x = ti.min(i * self.dx, 1.0 - i * self.dx)
-                dist_y = ti.min(j * self.dx, 1.0 - j * self.dx)
-                # mask = ti.math.smoothstep(0.0, 0.2, ti.min(dist_x, dist_y))
-                # force *= mask
+            rho = self.rho[i, j]
+            r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
+            dist = r.norm()
+
+            # Buoyancy: upward force proportional to dye density
+            force += ti.Vector([0.0, b_coeff * rho])
+
+            # Torque: counter-clockwise tangential force
+            if dist > 1e-6:
+                force_dir = ti.Vector([-r.y, r.x]) / dist
+                force += force_dir * t_coeff * rho
+
+            # Radial: outward force from center
+            if dist > 1e-6:
+                force += (r / (dist + 0.1)) * r_coeff * rho
 
             self.vel[i, j] += force * self.dt
 
-    def toggle_persistent_force(self, force_strength: float = 100.0, active: bool = True):
-        self.persistent_force_active = active
-        self.persistent_force_scale = force_strength
 
     def apply_image_gradient_torque(self, image_path: str, scale: float = 1.0, duration: float = 0.1, blur_sigma: float = 0.0):
         """
@@ -366,41 +357,6 @@ class FluidSimulation:
             # Periodic wrap-around happens inside sample
             new_field[i, j] = self.sample(field, p.x - 0.5, p.y - 0.5)
 
-    @ti.kernel
-    def advect_upwind(self, field: ti.template(), new_field: ti.template()):
-        """
-        Solves the advection equation using a first-order upwind finite difference scheme.
-
-        Mathematical detail:
-        q^{n+1}_{i,j} = q^n_{i,j} - Δt * (u * q_x + v * q_y)
-        Where spatial derivatives q_x and q_y are approximated based on the direction
-        of the local velocity to ensure numerical stability (upwind biasing):
-        If u > 0: q_x ≈ (q_{i,j} - q_{i-1,j}) / dx
-        If u < 0: q_x ≈ (q_{i+1,j} - q_{i,j}) / dx
-        """
-        for i, j in field:
-            u = self.vel[i, j]
-            val = field[i, j]
-            im1 = (i - 1) % self.res
-            ip1 = (i + 1) % self.res
-            jm1 = (j - 1) % self.res
-            jp1 = (j + 1) % self.res
-            if ti.static(self.bc_wall):
-                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
-                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
-                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
-                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
-
-            if u.x > 0:
-                val -= (self.dt / self.dx) * u.x * (field[i, j] - field[im1, j])
-            else:
-                val -= (self.dt / self.dx) * u.x * (field[ip1, j] - field[i, j])
-
-            if u.y > 0:
-                val -= (self.dt / self.dx) * u.y * (field[i, j] - field[i, jm1])
-            else:
-                val -= (self.dt / self.dx) * u.y * (field[i, jp1] - field[i, j])
-            new_field[i, j] = val
 
     @ti.kernel
     def advect_maccormack_step1(self, field: ti.template(), temp_field: ti.template()):
@@ -442,75 +398,6 @@ class FluidSimulation:
             val_corr = temp_field[i, j] - (self.dt / self.dx) * (u.x * (temp_field[i, j] - temp_field[im1, j]) + u.y * (temp_field[i, j] - temp_field[i, jm1]))
             new_field[i, j] = 0.5 * (field[i, j] + val_corr)
 
-    @ti.func
-    def minmod(self, a, b):
-        return 0.5 * (ti.math.sign(a) + ti.math.sign(b)) * ti.min(ti.abs(a), ti.abs(b))
-
-    @ti.kernel
-    def advect_tvd(self, field: ti.template(), new_field: ti.template()):
-        """
-        Solves the advection equation using a 2D TVD scheme with Minmod limiter (second-order).
-        Works for both scalar and vector fields.
-        """
-        for i, j in field:
-            u = self.vel[i, j]
-            val = field[i, j]
-
-            im2 = (i - 2) % self.res
-            im1 = (i - 1) % self.res
-            ip1 = (i + 1) % self.res
-            ip2 = (i + 2) % self.res
-            jm2 = (j - 2) % self.res
-            jm1 = (j - 1) % self.res
-            jp1 = (j + 1) % self.res
-            jp2 = (j + 2) % self.res
-            if ti.static(self.bc_wall):
-                im2 = ti.math.clamp(i - 2, 0, self.res - 1)
-                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
-                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
-                ip2 = ti.math.clamp(i + 2, 0, self.res - 1)
-                jm2 = ti.math.clamp(j - 2, 0, self.res - 1)
-                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
-                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
-                jp2 = ti.math.clamp(j + 2, 0, self.res - 1)
-
-            # x direction flux difference
-            if u.x > 0:
-                c = u.x * self.dt / self.dx
-                dq_i_plus_half = field[ip1, j] - field[i, j]
-                dq_i_minus_half = field[i, j] - field[im1, j]
-                dq_i_minus_3_half = field[im1, j] - field[im2, j]
-                flux_r = u.x * field[i, j] + 0.5 * u.x * (1.0 - c) * self.minmod(dq_i_plus_half, dq_i_minus_half)
-                flux_l = u.x * field[im1, j] + 0.5 * u.x * (1.0 - c) * self.minmod(dq_i_minus_half, dq_i_minus_3_half)
-                val -= (self.dt / self.dx) * (flux_r - flux_l)
-            else:
-                c = -u.x * self.dt / self.dx
-                dq_i_minus_half = field[i, j] - field[im1, j]
-                dq_i_plus_half = field[ip1, j] - field[i, j]
-                dq_i_plus_3_half = field[ip2, j] - field[ip1, j]
-                flux_r = u.x * field[ip1, j] - 0.5 * u.x * (1.0 - c) * self.minmod(dq_i_plus_half, dq_i_plus_3_half)
-                flux_l = u.x * field[i, j] - 0.5 * u.x * (1.0 - c) * self.minmod(dq_i_minus_half, dq_i_plus_half)
-                val -= (self.dt / self.dx) * (flux_r - flux_l)
-
-            # y direction flux difference
-            if u.y > 0:
-                c = u.y * self.dt / self.dx
-                dq_j_plus_half = field[i, jp1] - field[i, j]
-                dq_j_minus_half = field[i, j] - field[i, jm1]
-                dq_j_minus_3_half = field[i, jm1] - field[i, jm2]
-                flux_t = u.y * field[i, j] + 0.5 * u.y * (1.0 - c) * self.minmod(dq_j_plus_half, dq_j_minus_half)
-                flux_b = u.y * field[i, jm1] + 0.5 * u.y * (1.0 - c) * self.minmod(dq_j_minus_half, dq_j_minus_3_half)
-                val -= (self.dt / self.dx) * (flux_t - flux_b)
-            else:
-                c = -u.y * self.dt / self.dx
-                dq_j_minus_half = field[i, j] - field[i, jm1]
-                dq_j_plus_half = field[i, jp1] - field[i, j]
-                dq_j_plus_3_half = field[i, jp2] - field[i, jp1]
-                flux_t = u.y * field[i, jp1] - 0.5 * u.y * (1.0 - c) * self.minmod(dq_j_plus_half, dq_j_plus_3_half)
-                flux_b = u.y * field[i, j] - 0.5 * u.y * (1.0 - c) * self.minmod(dq_j_minus_half, dq_j_plus_half)
-                val -= (self.dt / self.dx) * (flux_t - flux_b)
-
-            new_field[i, j] = val
 
     @ti.func
     def weno5_reconstruct(self, v1, v2, v3, v4, v5):
@@ -754,23 +641,12 @@ class FluidSimulation:
             self.rho.copy_from(self.new_rho)
             self.advect_semi_lagrangian(self.vel, self.new_vel)
             self.vel.copy_from(self.new_vel)
-        elif self.advection_scheme == 1:
-            self.advect_upwind(self.rho, self.new_rho)
-            self.rho.copy_from(self.new_rho)
-            self.advect_upwind(self.vel, self.new_vel)
-            self.vel.copy_from(self.new_vel)
         elif self.advection_scheme == 2:
             # MacCormack
             self.advect_maccormack_step1(self.rho, self.new_rho)
             self.advect_maccormack_step2(self.rho, self.new_rho, self.rho)
             self.advect_maccormack_step1(self.vel, self.new_vel)
             self.advect_maccormack_step2(self.vel, self.new_vel, self.vel)
-        elif self.advection_scheme == 3:
-            # TVD
-            self.advect_tvd(self.rho, self.new_rho)
-            self.rho.copy_from(self.new_rho)
-            self.advect_tvd(self.vel, self.new_vel)
-            self.vel.copy_from(self.new_vel)
 
         elif self.advection_scheme == 4:
             # WENO5 + SSP-RK3
@@ -796,8 +672,11 @@ class FluidSimulation:
         else:
             self.dye_force_active = False
 
-        if self.persistent_force_active:
-            self._apply_persistent_force_kernel(self.persistent_force_scale)
+        self._apply_persistent_force_kernel(
+            self.config.buoyancy_coeff,
+            self.config.torque_coeff,
+            self.config.radial_coeff
+        )
 
         if self.bc_wall and not self.bc_open:
             self.apply_velocity_bc()
