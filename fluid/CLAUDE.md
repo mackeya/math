@@ -1,6 +1,7 @@
 # CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Always write comments in the code, and docstrings for every function and class.
+Use informative function names, even if they have to be a bit longer. Example: `select_candidate_words` rather than just `select_candidates`.
+Prefer pure functions and simple classes whenever possible.
 
 ## Running
 
