@@ -756,6 +756,13 @@ class FluidSimulation:
             self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
             self.vel.copy_from(self.new_vel)
 
+        # Optional per-step Laplacian-based unsharp pass on the dye field.
+        # Default-off via SimulationConfig.sharpen_strength = 0.0. When on,
+        # acts as artistic anti-diffusion -- see the sharpen_rho docstring.
+        if self.config.sharpen_strength != 0.0:
+            self.sharpen_rho(self.config.sharpen_strength)
+            self.rho.copy_from(self.new_rho)
+
         if self.bc_wall and not self.bc_open:
             self.apply_velocity_bc()
         if self.bc_absorbing:
