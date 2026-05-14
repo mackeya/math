@@ -389,24 +389,74 @@ class FluidSimulation:
             phi_hat[i, j] = self.sample(field, p.x - 0.5, p.y - 0.5)
 
     @ti.kernel
-    def advect_maccormack_step2(self, field: ti.template(), temp_field: ti.template(), new_field: ti.template()):
+    def advect_maccormack_correct(self, field: ti.template(),
+                                  phi_hat: ti.template(),
+                                  new_field: ti.template()):
         """
-        Step 2 (Corrector) of the MacCormack method for advection.
-        Uses backward differences on the intermediate field to correct the solution,
-        resulting in a scheme that is 2nd-order accurate in both time and space.
+        Corrector step of the Selle-style semi-Lagrangian MacCormack scheme.
 
-        Mathematical detail:
-        q^{n+1}_{i,j} = 0.5 * (q^n_{i,j} + q^*_{i,j} - Δt/dx * [u * (q^*_{i,j} - q^*_{i-1,j}) + v * (q^*_{i,j} - q^*_{i,j-1})])
+        For each grid cell x = (i + 0.5, j + 0.5) * dx:
+
+        1. Forward-trace from x by +u(x) * dt to obtain x_fwd, and sample
+           phi_hat at that location to obtain phi_hat_hat. This estimates the
+           value the predictor would have produced if started one step in the
+           future and traced backward to x -- i.e. an estimate of the smearing
+           introduced by the predictor.
+
+        2. Form the corrected estimate
+                  phi_corrected = phi_hat[x] + 0.5 * (field[x] - phi_hat_hat)
+           which removes the predictor's leading-order bias.
+
+        3. Clamp phi_corrected to the min and max of the four field values at
+           the cells surrounding the back-traced location x_back = x - u(x)*dt
+           (i.e. the same donor neighborhood the predictor's bilinear
+           interpolation drew from). This clamp is what makes the scheme
+           stable around sharp features: it prevents the corrector from
+           creating values outside the range of the data it was reconstructed
+           from.
+
+        Honors periodic vs wall boundary conditions through the same dispatch
+        used elsewhere in the file. Reference: Selle, Fedkiw, Kim, Liu,
+        Rossignac (2008), "An Unconditionally Stable MacCormack Method".
         """
         for i, j in field:
             u = self.vel[i, j]
-            im1 = (i - 1) % self.res
-            jm1 = (j - 1) % self.res
+
+            # Forward-trace location (grid coordinates), used to sample phi_hat
+            p_fwd = ti.Vector([i + 0.5, j + 0.5]) + self.dt * u / self.dx
+            phi_hat_hat = self.sample(phi_hat, p_fwd.x - 0.5, p_fwd.y - 0.5)
+
+            # Tentative second-order corrected value
+            phi_corrected = phi_hat[i, j] + 0.5 * (field[i, j] - phi_hat_hat)
+
+            # Back-trace location, used to find the donor neighborhood for the clamp
+            p_back = ti.Vector([i + 0.5, j + 0.5]) - self.dt * u / self.dx
+            i_b = int(ti.floor(p_back.x - 0.5))
+            j_b = int(ti.floor(p_back.y - 0.5))
+
+            # Default: periodic wrap. Wall: clamp-to-edge.
+            i0 = i_b % self.res
+            i1 = (i_b + 1) % self.res
+            j0 = j_b % self.res
+            j1 = (j_b + 1) % self.res
             if ti.static(self.bc_wall):
-                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
-                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
-            val_corr = temp_field[i, j] - (self.dt / self.dx) * (u.x * (temp_field[i, j] - temp_field[im1, j]) + u.y * (temp_field[i, j] - temp_field[i, jm1]))
-            new_field[i, j] = 0.5 * (field[i, j] + val_corr)
+                i0 = ti.math.clamp(i_b,     0, self.res - 1)
+                i1 = ti.math.clamp(i_b + 1, 0, self.res - 1)
+                j0 = ti.math.clamp(j_b,     0, self.res - 1)
+                j1 = ti.math.clamp(j_b + 1, 0, self.res - 1)
+
+            v00 = field[i0, j0]
+            v10 = field[i1, j0]
+            v01 = field[i0, j1]
+            v11 = field[i1, j1]
+
+            # Component-wise min/max/clamp: works identically for scalar and
+            # 2-vector fields, which is how the same kernel can advect both
+            # rho and vel.
+            lo = ti.min(ti.min(v00, v10), ti.min(v01, v11))
+            hi = ti.max(ti.max(v00, v10), ti.max(v01, v11))
+
+            new_field[i, j] = ti.math.clamp(phi_corrected, lo, hi)
 
 
     @ti.func
