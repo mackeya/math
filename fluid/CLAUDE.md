@@ -7,7 +7,7 @@ Prefer pure functions and simple classes whenever possible.
 
 ```bash
 # Install dependencies
-pip install taichi numpy pillow
+pip install taichi numpy pillow imageio[ffmpeg]
 
 # Run interactive simulation
 python main.py
@@ -25,7 +25,8 @@ This is a 2D incompressible fluid simulation using [Taichi](https://taichi-lang.
 
 **Core files:**
 - `simulation.py` — All simulation logic in `FluidSimulation` class with `SimulationConfig` dataclass
-- `main.py` — Interactive GUI loop using `ti.GUI`
+- `main.py` — Interactive GUI loop using `ti.GUI`. Press `M` in the GUI to toggle MP4 recording (output goes to `./recordings/`).
+- `video_recorder.py` — `VideoRecorder` class that streams `sim.rho` frames to MP4 via `imageio[ffmpeg]`
 
 **Simulation method (Chorin's Projection):**
 1. **Advection** — advects `rho` (dye density) and `vel` (velocity) using the selected scheme

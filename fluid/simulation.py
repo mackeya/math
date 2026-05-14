@@ -211,7 +211,7 @@ class FluidSimulation:
             # Torque: counter-clockwise tangential force
             if dist > 1e-6:
                 force_dir = ti.Vector([-r.y, r.x]) / dist
-                force += force_dir * t_coeff * rho
+                force += force_dir * t_coeff * (rho - 0.5)
 
             # Radial: outward force from center
             if dist > 1e-6:

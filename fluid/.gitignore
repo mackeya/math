@@ -1,0 +1,11 @@
+# Recorded videos from the interactive simulation (main.py, key 'm').
+recordings/
+
+# Python bytecode and caches.
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# macOS metadata.
+.DS_Store

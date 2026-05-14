@@ -1,17 +1,24 @@
 import taichi as ti
 import numpy as np
 from simulation import FluidSimulation, SimulationConfig
+from video_recorder import VideoRecorder
 
 def main():
     config = SimulationConfig()
     config.res = 512
+
     # Dye initialization
     config.init_type = 'patterns'
     config.init_type = 'image'
-    # Boundary conditions: 'periodic', 'wall', 'absorbing', or 'open'
-    config.bc_type = 'open'
-    # config.bc_type = 'absorbing'
-    # config.bc_type = 'wall'
+
+    # Boundary conditions:
+    # - 'periodic'
+    # - 'wall' and 'absorbing': same for the fluid itself, different for dye:
+    #       absorbing zeros out dye reaching the boundary
+    # - 'open': dye region surrounded by clean fluid at zero pressure,
+    #      velocity unconstrained at boundary
+    # config.bc_type = 'open'
+    config.bc_type = 'absorbing'
     # config.bc_type = 'periodic'
 
     sim = FluidSimulation(config)
@@ -37,81 +44,112 @@ def main():
     print("  Key D: Apply dye gradient force (gradual/dynamic)")
     print("  Key V: Toggle dye vortex (persistent)")
     print("  Key C: Toggle dye radial (persistent)")
+    print("  Key M: Toggle video recording (writes to ./recordings/)")
 
     prev_mouse = None
     DEFAULT_FORCE = 3.0  # default coefficient strength when toggling a force on
 
-    while gui.running:
-        # Handle events
-        if gui.get_event(ti.GUI.PRESS):
-            if gui.event.key == '1':
-                sim.advection_scheme = 0
-            elif gui.event.key == '2':
-                sim.advection_scheme = 4
-            elif gui.event.key == 'r':
-                sim.time = 0.0
-                if config.init_type == 'patterns':
-                    sim.init_patterns()
-                elif config.init_type == 'image':
-                    sim.init_from_image("./lenna.png")
-            elif gui.event.key == 'g':
-                sim.apply_image_gradient_torque("./lenna.png", scale=1.0, duration=0.1, blur_sigma=1.0)
-            elif gui.event.key == 'd':
-                sim.apply_dye_gradient_torque(scale=0.1, duration=0.1)
-            elif gui.event.key == 'b':
-                # Toggle buoyancy: set coefficient to default or zero it off
-                if sim.config.buoyancy_coeff < 1.0:
-                    sim.config.buoyancy_coeff = DEFAULT_FORCE
-                else:
-                    sim.config.buoyancy_coeff = 0.0
-            elif gui.event.key == 'v':
-                # Toggle torque
-                if sim.config.torque_coeff < 1.0:
-                    sim.config.torque_coeff = DEFAULT_FORCE
-                else:
-                    sim.config.torque_coeff = 0.0
-            elif gui.event.key == 'c':
-                # Toggle radial
-                if sim.config.radial_coeff < 1.0:
-                    sim.config.radial_coeff = DEFAULT_FORCE
-                else:
-                    sim.config.radial_coeff = 0.0
+    # Video recorder: starts in the stopped state. The 'm' key toggles it.
+    # One frame per rendered tick is appended at the configured fps, so
+    # playback is realtime-ish relative to the user's interactive session.
+    recorder = VideoRecorder(output_dir="recordings", fps=30)
 
-        # Handle mouse interaction
-        curr_mouse = gui.get_cursor_pos()
-        if prev_mouse is None:
+    try:
+        while gui.running:
+            # Handle events
+            if gui.get_event(ti.GUI.PRESS):
+                if gui.event.key == '1':
+                    sim.advection_scheme = 0
+                elif gui.event.key == '2':
+                    sim.advection_scheme = 4
+                elif gui.event.key == 'r':
+                    sim.time = 0.0
+                    if config.init_type == 'patterns':
+                        sim.init_patterns()
+                    elif config.init_type == 'image':
+                        sim.init_from_image("./lenna.png")
+                elif gui.event.key == 'g':
+                    sim.apply_image_gradient_torque("./lenna.png", scale=1.0, duration=0.1, blur_sigma=1.0)
+                elif gui.event.key == 'd':
+                    sim.apply_dye_gradient_torque(scale=0.1, duration=0.1)
+                elif gui.event.key == 'b':
+                    # Toggle buoyancy: set coefficient to default or zero it off
+                    if sim.config.buoyancy_coeff < 1.0:
+                        sim.config.buoyancy_coeff = DEFAULT_FORCE
+                    else:
+                        sim.config.buoyancy_coeff = 0.0
+                elif gui.event.key == 'v':
+                    # Toggle torque
+                    if sim.config.torque_coeff < 1.0:
+                        sim.config.torque_coeff = DEFAULT_FORCE
+                    else:
+                        sim.config.torque_coeff = 0.0
+                elif gui.event.key == 'c':
+                    # Toggle radial
+                    if sim.config.radial_coeff < 1.0:
+                        sim.config.radial_coeff = DEFAULT_FORCE
+                    else:
+                        sim.config.radial_coeff = 0.0
+                elif gui.event.key == 'm':
+                    # Toggle video recording. Each press starts a new clip
+                    # (with a fresh timestamped filename) or stops the
+                    # in-progress one. The HUD overlay indicates state.
+                    if recorder.is_recording:
+                        path = recorder.stop()
+                        print(f"Stopped recording: {path} ({recorder.frames_written} frames)")
+                    else:
+                        path = recorder.start()
+                        print(f"Recording to: {path}")
+
+            # Handle mouse interaction
+            curr_mouse = gui.get_cursor_pos()
+            if prev_mouse is None:
+                prev_mouse = curr_mouse
+
+            if gui.is_pressed(ti.GUI.LMB):
+                # Apply force proportional to mouse movement
+                dx, dy = curr_mouse[0] - prev_mouse[0], curr_mouse[1] - prev_mouse[1]
+                sim.apply_force(curr_mouse[0], curr_mouse[1], dx * 40000, dy * 40000, 0.03)
+
+            if gui.is_pressed(ti.GUI.RMB):
+                sim.fill_dye(curr_mouse[0], curr_mouse[1], 0.02, 5.0)
+
+            if gui.is_pressed('f'):
+                sim.apply_bottom_force(1000.0, 200.0)
+
             prev_mouse = curr_mouse
 
-        if gui.is_pressed(ti.GUI.LMB):
-            # Apply force proportional to mouse movement
-            dx, dy = curr_mouse[0] - prev_mouse[0], curr_mouse[1] - prev_mouse[1]
-            sim.apply_force(curr_mouse[0], curr_mouse[1], dx * 40000, dy * 40000, 0.03)
+            # Step simulation with substepping for stability
+            substeps = 10
+            for _ in range(substeps):
+                sim.step()
 
-        if gui.is_pressed(ti.GUI.RMB):
-            sim.fill_dye(curr_mouse[0], curr_mouse[1], 0.02, 5.0)
+            # Render. Capture the same numpy array that gets handed to the
+            # GUI so the recorded video matches exactly what the user sees,
+            # minus the HUD overlays which are drawn separately by gui.text.
+            dye_img = sim.rho.to_numpy()
+            recorder.add_frame(dye_img)
+            gui.set_image(dye_img)
 
-        if gui.is_pressed('f'):
-            sim.apply_bottom_force(1000.0, 200.0)
+            # Show current scheme info
+            gui.text(f"Scheme: {advection_names[sim.advection_scheme]}", pos=(0.05, 0.95), color=0xFFFFFF)
+            gui.text(f"Time: {sim.time:.2f}s", pos=(0.05, 0.90), color=0xFFFFFF)
+            gui.text(f"dt: {sim.dt}, substeps: {substeps}", pos=(0.05, 0.85), color=0xFFFFFF)
+            bc_label = config.bc_type if config.bc_type in ('periodic', 'open') else f"{config.bc_type} (slip={config.wall_slip:.1f})"
+            gui.text(f"BC: {bc_label}", pos=(0.05, 0.80), color=0xFFFFFF)
 
-        prev_mouse = curr_mouse
+            # Recording indicator. Drawn after set_image so it appears in the
+            # GUI window only; never enters the recorded video.
+            if recorder.is_recording:
+                gui.text(f"REC ● {recorder.frames_written}f", pos=(0.80, 0.95), color=0xFF3333)
 
-        # Step simulation with substepping for stability
-        substeps = 10
-        for _ in range(substeps):
-            sim.step()
-
-        # Render
-        dye_img = sim.rho.to_numpy()
-        gui.set_image(dye_img)
-
-        # Show current scheme info
-        gui.text(f"Scheme: {advection_names[sim.advection_scheme]}", pos=(0.05, 0.95), color=0xFFFFFF)
-        gui.text(f"Time: {sim.time:.2f}s", pos=(0.05, 0.90), color=0xFFFFFF)
-        gui.text(f"dt: {sim.dt}, substeps: {substeps}", pos=(0.05, 0.85), color=0xFFFFFF)
-        bc_label = config.bc_type if config.bc_type in ('periodic', 'open') else f"{config.bc_type} (slip={config.wall_slip:.1f})"
-        gui.text(f"BC: {bc_label}", pos=(0.05, 0.80), color=0xFFFFFF)
-
-        gui.show()
+            gui.show()
+    finally:
+        # Flush any in-progress recording on shutdown (normal exit or
+        # exception) so the MP4 trailer is written and the file is playable.
+        final_path = recorder.stop()
+        if final_path is not None:
+            print(f"Stopped recording on exit: {final_path} ({recorder.frames_written} frames)")
 
 if __name__ == "__main__":
     main()
