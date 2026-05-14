@@ -18,6 +18,10 @@ class SimulationConfig:
     bc_type: str = 'periodic'   # 'periodic', 'wall', 'absorbing', or 'open'
     # 0.0 = no-slip, 1.0 = free-slip (only used when bc_type='wall').  All the action here happens above 0.99
     wall_slip: float = 0.0
+    # Per-step Laplacian-based unsharp mask strength applied to rho. 0 = off
+    # (default). Small positive values (single digits) act as edge enhancement;
+    # large values are unstable. This is a purely artistic anti-diffusion knob.
+    sharpen_strength: float = 0.0
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
 
@@ -80,6 +84,12 @@ class FluidSimulation:
         self.vel_1 = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.vel_2 = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.dq_vel = ti.Vector.field(2, float, shape=(self.res, self.res))
+
+        # Scratch fields for the Selle-style MacCormack predictor (phi_hat).
+        # Used only when advection_scheme == 2. Kept separate from the RK3
+        # intermediates so the two schemes never share scratch state.
+        self.predict_rho = ti.field(float, shape=(self.res, self.res))
+        self.predict_vel = ti.Vector.field(2, float, shape=(self.res, self.res))
 
         # Gradual force application
         self.image_grad = ti.Vector.field(2, float, shape=(self.res, self.res))
