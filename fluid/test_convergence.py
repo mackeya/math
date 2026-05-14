@@ -71,7 +71,10 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
             sim.rho.copy_from(sim.new_rho)
         elif sim.advection_scheme == 2:
             sim.advect_maccormack_predict(sim.rho, sim.predict_rho)
-            sim.advect_maccormack_correct(sim.rho, sim.predict_rho, sim.new_rho)
+            sim.advect_maccormack_correct(
+                sim.rho, sim.predict_rho, sim.new_rho,
+                sim.maccormack_clamp_width,
+            )
             sim.rho.copy_from(sim.new_rho)
         elif sim.advection_scheme == 4:
             sim.step_weno(sim.rho, sim.rho_1, sim.rho_2, sim.new_rho, sim.dq_rho)

@@ -29,6 +29,15 @@ class SimulationConfig:
     # instance). 0 = Semi-Lagrangian, 2 = Selle-style MacCormack + clamp,
     # 4 = WENO5 + SSP-RK3, 5 = Hybrid (WENO5 on vel, MacCormack on rho).
     advection_scheme: int = 4
+    # Donor neighborhood width for the MacCormack extrema clamp. 2 = the
+    # standard bilinear support (4 cells) at the back-traced location.
+    # 3 = a 3x3 stencil (9 cells) around the lower-left bilinear cell;
+    # includes the bilinear support plus 5 surrounding cells. The wider
+    # stencil reduces ringing at sharp gradients by triggering the
+    # fallback-to-SL path less often, at roughly 2x the clamp's memory
+    # traffic. Only affects advection_scheme 2 and 5. Runtime-switchable
+    # via sim.maccormack_clamp_width.
+    maccormack_clamp_width: int = 2
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
 
@@ -84,6 +93,11 @@ class FluidSimulation:
         # Advection scheme: 0 = Semi-Lagrangian, 2 = Selle-style MacCormack,
         # 4 = WENO5, 5 = Hybrid (WENO on vel, MacCormack on rho).
         self.advection_scheme = config.advection_scheme
+        # MacCormack clamp donor neighborhood width (2 or 3). Runtime-
+        # switchable; the corrector kernel is specialized per value so the
+        # switch triggers one extra kernel compile the first time each
+        # value is used.
+        self.maccormack_clamp_width = config.maccormack_clamp_width
 
         # RK3 intermediate fields
         self.rho_1 = ti.field(float, shape=(self.res, self.res))
@@ -426,7 +440,8 @@ class FluidSimulation:
     @ti.kernel
     def advect_maccormack_correct(self, field: ti.template(),
                                   phi_hat: ti.template(),
-                                  new_field: ti.template()):
+                                  new_field: ti.template(),
+                                  clamp_width: ti.template()):
         """
         Corrector step of the Selle-style semi-Lagrangian MacCormack scheme.
 
@@ -442,17 +457,27 @@ class FluidSimulation:
                   phi_corrected = phi_hat[x] + 0.5 * (field[x] - phi_hat_hat)
            which removes the predictor's leading-order bias.
 
-        3. Clamp phi_corrected to the min and max of the four field values at
-           the cells surrounding the back-traced location x_back = x - u(x)*dt
-           (i.e. the same donor neighborhood the predictor's bilinear
-           interpolation drew from). This clamp is what makes the scheme
-           stable around sharp features: it prevents the corrector from
-           creating values outside the range of the data it was reconstructed
-           from.
+        3. Compute the donor neighborhood [lo, hi] around the back-traced
+           location x_back = x - u(x)*dt. With clamp_width=2 this is the
+           bilinear support (4 cells); with clamp_width=3 it is the 3x3
+           stencil (9 cells) that includes the bilinear support plus 5
+           surrounding cells. The wider stencil reduces ringing at sharp
+           gradients by triggering the fallback path less often.
+
+        4. Modified MacCormack: if phi_corrected lies inside [lo, hi], use
+           it; otherwise fall back to phi_hat[x] (the safe SL value). The
+           fallback avoids the stair-step / halo artifacts that hard
+           clamping to the [lo, hi] boundary produces.
+
+        `clamp_width` is a `ti.template()` argument, so Taichi specializes
+        the kernel per value (2 or 3) -- the branch below is resolved at
+        compile time and costs nothing per cell at runtime.
 
         Honors periodic vs wall boundary conditions through the same dispatch
         used elsewhere in the file. Reference: Selle, Fedkiw, Kim, Liu,
-        Rossignac (2008), "An Unconditionally Stable MacCormack Method".
+        Rossignac (2008), "An Unconditionally Stable MacCormack Method";
+        Bridson, "Fluid Simulation for Computer Graphics", 2nd ed., Ch. 5
+        (modified MacCormack fallback).
         """
         for i, j in field:
             u = self.vel[i, j]
@@ -469,37 +494,55 @@ class FluidSimulation:
             i_b = int(ti.floor(p_back.x - 0.5))
             j_b = int(ti.floor(p_back.y - 0.5))
 
-            # Default: periodic wrap. Wall: clamp-to-edge.
-            i0 = i_b % self.res
-            i1 = (i_b + 1) % self.res
-            j0 = j_b % self.res
-            j1 = (j_b + 1) % self.res
-            if ti.static(self.bc_wall):
-                i0 = ti.math.clamp(i_b,     0, self.res - 1)
-                i1 = ti.math.clamp(i_b + 1, 0, self.res - 1)
-                j0 = ti.math.clamp(j_b,     0, self.res - 1)
-                j1 = ti.math.clamp(j_b + 1, 0, self.res - 1)
+            # Donor neighborhood [lo, hi]. Both branches use component-wise
+            # min/max which works identically for scalar and 2-vector fields.
+            lo = field[i, j]   # placeholder; overwritten below
+            hi = field[i, j]
+            if ti.static(clamp_width == 3):
+                # 3x3 donor stencil from (i_b-1, j_b-1) to (i_b+1, j_b+1):
+                # the 4 bilinear support cells plus 5 surrounding cells.
+                # Initialize lo/hi from the lower-left of the stencil, then
+                # expand to cover all 9 cells.
+                i_init = (i_b - 1) % self.res
+                j_init = (j_b - 1) % self.res
+                if ti.static(self.bc_wall):
+                    i_init = ti.math.clamp(i_b - 1, 0, self.res - 1)
+                    j_init = ti.math.clamp(j_b - 1, 0, self.res - 1)
+                lo = field[i_init, j_init]
+                hi = lo
+                for di in ti.static(range(-1, 2)):
+                    for dj in ti.static(range(-1, 2)):
+                        ii = (i_b + di) % self.res
+                        jj = (j_b + dj) % self.res
+                        if ti.static(self.bc_wall):
+                            ii = ti.math.clamp(i_b + di, 0, self.res - 1)
+                            jj = ti.math.clamp(j_b + dj, 0, self.res - 1)
+                        v = field[ii, jj]
+                        lo = ti.min(lo, v)
+                        hi = ti.max(hi, v)
+            else:
+                # 2x2 donor stencil: the predictor's bilinear support.
+                i0 = i_b % self.res
+                i1 = (i_b + 1) % self.res
+                j0 = j_b % self.res
+                j1 = (j_b + 1) % self.res
+                if ti.static(self.bc_wall):
+                    i0 = ti.math.clamp(i_b,     0, self.res - 1)
+                    i1 = ti.math.clamp(i_b + 1, 0, self.res - 1)
+                    j0 = ti.math.clamp(j_b,     0, self.res - 1)
+                    j1 = ti.math.clamp(j_b + 1, 0, self.res - 1)
+                v00 = field[i0, j0]
+                v10 = field[i1, j0]
+                v01 = field[i0, j1]
+                v11 = field[i1, j1]
+                lo = ti.min(ti.min(v00, v10), ti.min(v01, v11))
+                hi = ti.max(ti.max(v00, v10), ti.max(v01, v11))
 
-            v00 = field[i0, j0]
-            v10 = field[i1, j0]
-            v01 = field[i0, j1]
-            v11 = field[i1, j1]
-
-            # Component-wise min/max: works identically for scalar and
-            # 2-vector fields, which is how the same kernel can advect both
-            # rho and vel.
-            lo = ti.min(ti.min(v00, v10), ti.min(v01, v11))
-            hi = ti.max(ti.max(v00, v10), ti.max(v01, v11))
-
-            # Modified MacCormack: instead of hard-clamping the corrected
-            # value to [lo, hi] (which pins out-of-range cells to the
-            # boundary and produces stair-step / halo artifacts on sharp
-            # features), fall back to the safe semi-Lagrangian predictor
-            # value wherever the corrector would have been clamped. This
-            # trades a small amount of crispness at clamp-triggering points
-            # for a much cleaner gradient elsewhere.
-            # Reference: Bridson, "Fluid Simulation for Computer Graphics",
-            # 2nd ed., Ch. 5.
+            # Modified MacCormack: if the corrected value would have been
+            # clamped, fall back to the safe semi-Lagrangian predictor
+            # value instead of pinning to the boundary. The pinned-boundary
+            # variant produces stair-step / halo artifacts on sharp dye
+            # features; the fallback is smoother.
             clamped = ti.math.clamp(phi_corrected, lo, hi)
             new_field[i, j] = ti.select(
                 clamped == phi_corrected, phi_corrected, phi_hat[i, j]
@@ -793,11 +836,12 @@ class FluidSimulation:
             # The corrector cannot be written in-place because it reads field
             # at the donor neighborhood around the back-traced location, so we
             # write into new_rho / new_vel and copy back.
+            cw = self.maccormack_clamp_width
             self.advect_maccormack_predict(self.rho, self.predict_rho)
-            self.advect_maccormack_correct(self.rho, self.predict_rho, self.new_rho)
+            self.advect_maccormack_correct(self.rho, self.predict_rho, self.new_rho, cw)
             self.rho.copy_from(self.new_rho)
             self.advect_maccormack_predict(self.vel, self.predict_vel)
-            self.advect_maccormack_correct(self.vel, self.predict_vel, self.new_vel)
+            self.advect_maccormack_correct(self.vel, self.predict_vel, self.new_vel, cw)
             self.vel.copy_from(self.new_vel)
 
         elif self.advection_scheme == 4:
@@ -814,7 +858,10 @@ class FluidSimulation:
             # it is advected by the current velocity, not the just-updated
             # one (consistent with the other scheme dispatches).
             self.advect_maccormack_predict(self.rho, self.predict_rho)
-            self.advect_maccormack_correct(self.rho, self.predict_rho, self.new_rho)
+            self.advect_maccormack_correct(
+                self.rho, self.predict_rho, self.new_rho,
+                self.maccormack_clamp_width,
+            )
             self.rho.copy_from(self.new_rho)
             self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
             self.vel.copy_from(self.new_vel)

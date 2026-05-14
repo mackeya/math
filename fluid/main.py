@@ -10,7 +10,7 @@ def main():
 
     # Dye initialization
     config.init_type = 'patterns'
-    config.init_type = 'image'
+    # config.init_type = 'image'
 
     # Boundary conditions:
     # - 'periodic'
