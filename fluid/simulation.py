@@ -19,8 +19,11 @@ class SimulationConfig:
     # 0.0 = no-slip, 1.0 = free-slip (only used when bc_type='wall').  All the action here happens above 0.99
     wall_slip: float = 0.0
     # Per-step Laplacian-based unsharp mask strength applied to rho. 0 = off
-    # (default). Small positive values (single digits) act as edge enhancement;
-    # large values are unstable. This is a purely artistic anti-diffusion knob.
+    # (default). The effective per-step coefficient is strength * dt / dx^2,
+    # so usable values scale with resolution and timestep. At res=128 and
+    # dt=3e-4, strengths around 1e-5 to 1e-4 give mild edge enhancement;
+    # values above ~1e-3 blow up over a few hundred steps. Purely artistic
+    # anti-diffusion -- has no physical meaning.
     sharpen_strength: float = 0.0
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
@@ -473,8 +476,12 @@ class FluidSimulation:
         coefficient `strength`. Anti-diffusion is unconditionally unstable in
         the long run; this kernel is intended as a per-step edge enhancer on
         features that advection has just smoothed, not as a standalone PDE
-        solver. Keep `strength` modest (single-digit values are typical) and
-        leave it at zero when sharpening isn't wanted (see SimulationConfig).
+        solver. The effective per-step amplification at the Nyquist
+        wavelength is ~(1 + 4 * strength * dt / dx^2), so usable strengths
+        depend on resolution and timestep. At res=128 with dt=3e-4, useful
+        values are around 1e-5 to 1e-4; values above ~1e-3 blow up over a
+        few hundred steps. Leave at zero when sharpening isn't wanted (see
+        SimulationConfig).
 
         Honors the same periodic vs wall boundary convention as the rest of
         the simulation.
