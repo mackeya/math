@@ -105,18 +105,28 @@ reads, `new_field` must be a separate field from `field` — writing in-place
 would race against other threads of the same kernel still reading the original
 `field` values.
 
-We use the existing RK3 intermediate fields (`rho_1`, `vel_1`) as the scratch
-`phi_hat` storage, and continue to use `new_rho` / `new_vel` as the corrector
-output, copied back into `rho` / `vel` as the final step. No new fields are
-added. The dispatch in `step()` becomes:
+We add two new fields dedicated to MacCormack's predictor scratch:
+
+- `self.predict_rho`: scalar field, shape `(res, res)` — holds `φ_hat` for the
+  density predictor.
+- `self.predict_vel`: 2-vector field, shape `(res, res)` — holds `φ_hat` for
+  the velocity predictor.
+
+The corrector output continues to use the existing `new_rho` / `new_vel`,
+copied back into `rho` / `vel` as the final step. Dedicated fields are used
+rather than overloading the RK3 intermediates (`rho_1`, `vel_1`) so the
+intent is locally clear and there is no hidden coupling between
+mutually-exclusive advection schemes.
+
+The dispatch in `step()` becomes:
 
 ```
 elif self.advection_scheme == 2:
-    self.advect_maccormack_predict(self.rho, self.rho_1)
-    self.advect_maccormack_correct(self.rho, self.rho_1, self.new_rho)
+    self.advect_maccormack_predict(self.rho, self.predict_rho)
+    self.advect_maccormack_correct(self.rho, self.predict_rho, self.new_rho)
     self.rho.copy_from(self.new_rho)
-    self.advect_maccormack_predict(self.vel, self.vel_1)
-    self.advect_maccormack_correct(self.vel, self.vel_1, self.new_vel)
+    self.advect_maccormack_predict(self.vel, self.predict_vel)
+    self.advect_maccormack_correct(self.vel, self.predict_vel, self.new_vel)
     self.vel.copy_from(self.new_vel)
 ```
 
@@ -170,12 +180,14 @@ one.
 
 - `simulation.py`:
   - Add `sharpen_strength: float = 0.0` to `SimulationConfig`.
+  - Allocate two new Taichi fields in `__init__`: `self.predict_rho` (scalar)
+    and `self.predict_vel` (2-vector), both shape `(res, res)`.
   - Replace bodies of `advect_maccormack_step1` and `advect_maccormack_step2`
     with `advect_maccormack_predict` and `advect_maccormack_correct` (rename
     to make the change visible and reflect the new algorithm).
   - Add kernel `sharpen_rho()`.
   - Update the `advection_scheme == 2` branch in `step()` to use the new
-    kernels.
+    kernels and the new predictor-scratch fields.
   - In `step()`, after advection and BC, call `sharpen_rho()` if
     `sharpen_strength != 0.0` (gate on `ti.static` for free at compile time).
   - Update docstrings on the affected kernels and on `SimulationConfig`.
@@ -242,11 +254,11 @@ with the artistic-purpose framing. Item 1 is the only quantitative gate.
   clamp would otherwise race against other threads' writes within the same
   kernel.
 
-- **Reuse of `rho_1` / `vel_1` for predictor scratch** — these fields are
-  also used as RK3 stage-1 buffers by the WENO5 scheme. The two schemes are
-  mutually exclusive at runtime (chosen via `advection_scheme`), so the
-  reuse is safe; flagged here only because it's the kind of overload that
-  invites confusion later. The kernel docstrings will note this.
+- **Memory footprint of new scratch fields** — `predict_rho` and
+  `predict_vel` add one scalar field and one 2-vector field at the
+  simulation resolution. At `res = 512` that's roughly 3 MB of extra GPU
+  memory. Trivial compared to the existing field count, but flagged for
+  completeness.
 
 ## Non-goals / explicitly deferred
 
