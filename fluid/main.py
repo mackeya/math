@@ -30,13 +30,14 @@ def main():
     gui = ti.GUI("2D Fluid Simulation Demo", res=(config.res, config.res))
 
     # Simple UI state
-    advection_names = {0: "Semi-Lagrangian", 4: "WENO-5"}
+    advection_names = {0: "Semi-Lagrangian", 2: "MacCormack-SL", 4: "WENO-5"}
 
     print("Controls:")
     print("  Mouse Left: Add Force (Drag)")
     print("  Mouse Right: Add Dye")
     print("  Key 1: Semi-Lagrangian (Stable, Smooth)")
     print("  Key 2: WENO-5")
+    print("  Key 3: Selle-style MacCormack with extrema clamp")
     print("  Key R: Reset Patterns")
     print("  Key F: Apply force to bottom half")
     print("  Key B: Toggle dye gravity (persistent)")
@@ -62,6 +63,8 @@ def main():
                     sim.advection_scheme = 0
                 elif gui.event.key == '2':
                     sim.advection_scheme = 4
+                elif gui.event.key == '3':
+                    sim.advection_scheme = 2
                 elif gui.event.key == 'r':
                     sim.time = 0.0
                     if config.init_type == 'patterns':
