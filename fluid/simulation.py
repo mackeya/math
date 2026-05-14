@@ -702,11 +702,16 @@ class FluidSimulation:
             self.advect_semi_lagrangian(self.vel, self.new_vel)
             self.vel.copy_from(self.new_vel)
         elif self.advection_scheme == 2:
-            # MacCormack
-            self.advect_maccormack_step1(self.rho, self.new_rho)
-            self.advect_maccormack_step2(self.rho, self.new_rho, self.rho)
-            self.advect_maccormack_step1(self.vel, self.new_vel)
-            self.advect_maccormack_step2(self.vel, self.new_vel, self.vel)
+            # Selle-style semi-Lagrangian MacCormack with extrema clamp.
+            # The corrector cannot be written in-place because it reads field
+            # at the donor neighborhood around the back-traced location, so we
+            # write into new_rho / new_vel and copy back.
+            self.advect_maccormack_predict(self.rho, self.predict_rho)
+            self.advect_maccormack_correct(self.rho, self.predict_rho, self.new_rho)
+            self.rho.copy_from(self.new_rho)
+            self.advect_maccormack_predict(self.vel, self.predict_vel)
+            self.advect_maccormack_correct(self.vel, self.predict_vel, self.new_vel)
+            self.vel.copy_from(self.new_vel)
 
         elif self.advection_scheme == 4:
             # WENO5 + SSP-RK3
