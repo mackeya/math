@@ -369,24 +369,24 @@ class FluidSimulation:
 
 
     @ti.kernel
-    def advect_maccormack_step1(self, field: ti.template(), temp_field: ti.template()):
+    def advect_maccormack_predict(self, field: ti.template(), phi_hat: ti.template()):
         """
-        Step 1 (Predictor) of the MacCormack method for advection.
-        Calculates an intermediate field using forward local differences.
+        Predictor step of the Selle-style semi-Lagrangian MacCormack scheme.
 
-        Mathematical detail:
-        q^*_{i,j} = q^n_{i,j} - Δt/dx * [u * (q^n_{i+1,j} - q^n_{i,j}) + v * (q^n_{i,j+1} - q^n_{i,j})]
+        Performs one semi-Lagrangian back-trace from each grid cell along the
+        local velocity and stores the bilinearly interpolated value in phi_hat:
+
+            phi_hat(x) = field(x - u(x) * dt)
+
+        where x = (i + 0.5, j + 0.5) * dx is the cell center. This is
+        mathematically identical to one plain semi-Lagrangian advection step.
+        It is paired with advect_maccormack_correct, which uses phi_hat to
+        estimate and remove the diffusive error of this single SL pass.
         """
         for i, j in field:
-            u = self.vel[i, j]
-            val = field[i, j]
-            ip1 = (i + 1) % self.res
-            jp1 = (j + 1) % self.res
-            if ti.static(self.bc_wall):
-                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
-                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
-            val -= (self.dt / self.dx) * (u.x * (field[ip1, j] - field[i, j]) + u.y * (field[i, jp1] - field[i, j]))
-            temp_field[i, j] = val
+            # Back-trace location (positions in grid coordinates)
+            p = ti.Vector([i + 0.5, j + 0.5]) - self.dt * self.vel[i, j] / self.dx
+            phi_hat[i, j] = self.sample(field, p.x - 0.5, p.y - 0.5)
 
     @ti.kernel
     def advect_maccormack_step2(self, field: ti.template(), temp_field: ti.template(), new_field: ti.template()):
