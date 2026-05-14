@@ -73,8 +73,9 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
             sim.advect_upwind(sim.rho, sim.new_rho)
             sim.rho.copy_from(sim.new_rho)
         elif sim.advection_scheme == 2:
-            sim.advect_maccormack_step1(sim.rho, sim.new_rho)
-            sim.advect_maccormack_step2(sim.rho, sim.new_rho, sim.rho)
+            sim.advect_maccormack_predict(sim.rho, sim.predict_rho)
+            sim.advect_maccormack_correct(sim.rho, sim.predict_rho, sim.new_rho)
+            sim.rho.copy_from(sim.new_rho)
         elif sim.advection_scheme == 3:
             sim.advect_tvd(sim.rho, sim.new_rho)
             sim.rho.copy_from(sim.new_rho)
