@@ -2,7 +2,6 @@
 Always write comments in the code, and docstrings for every function and class.
 Use informative function names, even if they have to be a bit longer. Example: `select_candidate_words` rather than just `select_candidates`.
 Prefer pure functions and simple classes whenever possible.
-Avoid running git commands if possible -- allow the user to do this instead.
 
 ## Running
 
