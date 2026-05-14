@@ -100,6 +100,10 @@ class FluidSimulation:
         self.predict_rho = ti.field(float, shape=(self.res, self.res))
         self.predict_vel = ti.Vector.field(2, float, shape=(self.res, self.res))
 
+        # Scalar 0-d field used as the accumulator for the max-CFL reduction
+        # in max_cfl(). Lives on the simulation so we don't allocate per call.
+        self._max_vel_norm = ti.field(float, shape=())
+
         # Gradual force application
         self.image_grad = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.force_duration = 0.0
@@ -359,6 +363,28 @@ class FluidSimulation:
                f * g * q[i1, j1]
 
     @ti.kernel
+    def _reduce_max_vel_norm(self):
+        """
+        Reduction kernel that fills self._max_vel_norm[None] with the maximum
+        |vel| value across the grid. Used by max_cfl() as a building block.
+        """
+        self._max_vel_norm[None] = 0.0
+        for i, j in self.vel:
+            ti.atomic_max(self._max_vel_norm[None], self.vel[i, j].norm())
+
+    def max_cfl(self) -> float:
+        """
+        Returns the current maximum CFL number across the grid:
+            CFL = max(|u|) * dt / dx
+        Values above ~1.0 indicate the per-step advection trajectory is
+        crossing more than one cell, at which point linear back-traces
+        (semi-Lagrangian, MacCormack) lose accuracy. Useful as a diagnostic
+        for whether observed artifacts are CFL-induced.
+        """
+        self._reduce_max_vel_norm()
+        return float(self._max_vel_norm[None]) * self.dt / self.dx
+
+    @ti.kernel
     def advect_semi_lagrangian(self, field: ti.template(), new_field: ti.template()):
         """
         Solves the advection equation ∂q/∂t + (u · ∇)q = 0 using the Semi-Lagrangian method.
@@ -459,13 +485,25 @@ class FluidSimulation:
             v01 = field[i0, j1]
             v11 = field[i1, j1]
 
-            # Component-wise min/max/clamp: works identically for scalar and
+            # Component-wise min/max: works identically for scalar and
             # 2-vector fields, which is how the same kernel can advect both
             # rho and vel.
             lo = ti.min(ti.min(v00, v10), ti.min(v01, v11))
             hi = ti.max(ti.max(v00, v10), ti.max(v01, v11))
 
-            new_field[i, j] = ti.math.clamp(phi_corrected, lo, hi)
+            # Modified MacCormack: instead of hard-clamping the corrected
+            # value to [lo, hi] (which pins out-of-range cells to the
+            # boundary and produces stair-step / halo artifacts on sharp
+            # features), fall back to the safe semi-Lagrangian predictor
+            # value wherever the corrector would have been clamped. This
+            # trades a small amount of crispness at clamp-triggering points
+            # for a much cleaner gradient elsewhere.
+            # Reference: Bridson, "Fluid Simulation for Computer Graphics",
+            # 2nd ed., Ch. 5.
+            clamped = ti.math.clamp(phi_corrected, lo, hi)
+            new_field[i, j] = ti.select(
+                clamped == phi_corrected, phi_corrected, phi_hat[i, j]
+            )
 
 
     @ti.kernel

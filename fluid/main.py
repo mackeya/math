@@ -10,7 +10,7 @@ def main():
 
     # Dye initialization
     config.init_type = 'patterns'
-    # config.init_type = 'image'
+    config.init_type = 'image'
 
     # Boundary conditions:
     # - 'periodic'
@@ -149,6 +149,12 @@ def main():
             gui.text(f"dt: {sim.dt}, substeps: {substeps}", pos=(0.05, 0.85), color=0xFFFFFF)
             bc_label = config.bc_type if config.bc_type in ('periodic', 'open') else f"{config.bc_type} (slip={config.wall_slip:.1f})"
             gui.text(f"BC: {bc_label}", pos=(0.05, 0.80), color=0xFFFFFF)
+            # CFL diagnostic: max(|u|) * dt / dx. Highlighted red when above 1.0
+            # because linear back-traces lose accuracy beyond that, which
+            # produces flow-aligned streaking artifacts under MacCormack / SL.
+            cfl = sim.max_cfl()
+            cfl_color = 0xFF3333 if cfl > 1.0 else 0xFFFFFF
+            gui.text(f"max CFL: {cfl:.2f}", pos=(0.05, 0.75), color=cfl_color)
 
             # Recording indicator. Drawn after set_image so it appears in the
             # GUI window only; never enters the recorded video.
