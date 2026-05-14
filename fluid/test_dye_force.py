@@ -22,7 +22,7 @@ def test_dye_gradient_force():
     # Apply dye gradient force
     scale = 100.0
     duration = 0.1
-    sim.apply_dye_gradient_force(scale=scale, duration=duration)
+    sim.apply_dye_gradient_torque(scale=scale, duration=duration)
     
     # Run one step
     sim.step()

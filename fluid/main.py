@@ -6,6 +6,7 @@ from video_recorder import VideoRecorder
 def main():
     config = SimulationConfig()
     config.res = 512
+    config.sharpen_strength = 0e-6
 
     # Dye initialization
     config.init_type = 'patterns'
@@ -30,7 +31,12 @@ def main():
     gui = ti.GUI("2D Fluid Simulation Demo", res=(config.res, config.res))
 
     # Simple UI state
-    advection_names = {0: "Semi-Lagrangian", 2: "MacCormack-SL", 4: "WENO-5"}
+    advection_names = {
+        0: "Semi-Lagrangian",
+        2: "MacCormack-SL",
+        4: "WENO-5",
+        5: "Hybrid (WENO vel + MC rho)",
+    }
 
     print("Controls:")
     print("  Mouse Left: Add Force (Drag)")
@@ -38,6 +44,7 @@ def main():
     print("  Key 1: Semi-Lagrangian (Stable, Smooth)")
     print("  Key 2: WENO-5")
     print("  Key 3: Selle-style MacCormack with extrema clamp")
+    print("  Key 4: Hybrid (WENO vel + MacCormack rho)")
     print("  Key R: Reset Patterns")
     print("  Key F: Apply force to bottom half")
     print("  Key B: Toggle dye gravity (persistent)")
@@ -65,6 +72,8 @@ def main():
                     sim.advection_scheme = 4
                 elif gui.event.key == '3':
                     sim.advection_scheme = 2
+                elif gui.event.key == '4':
+                    sim.advection_scheme = 5
                 elif gui.event.key == 'r':
                     sim.time = 0.0
                     if config.init_type == 'patterns':

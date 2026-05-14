@@ -69,15 +69,9 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
         if sim.advection_scheme == 0:
             sim.advect_semi_lagrangian(sim.rho, sim.new_rho)
             sim.rho.copy_from(sim.new_rho)
-        elif sim.advection_scheme == 1:
-            sim.advect_upwind(sim.rho, sim.new_rho)
-            sim.rho.copy_from(sim.new_rho)
         elif sim.advection_scheme == 2:
             sim.advect_maccormack_predict(sim.rho, sim.predict_rho)
             sim.advect_maccormack_correct(sim.rho, sim.predict_rho, sim.new_rho)
-            sim.rho.copy_from(sim.new_rho)
-        elif sim.advection_scheme == 3:
-            sim.advect_tvd(sim.rho, sim.new_rho)
             sim.rho.copy_from(sim.new_rho)
         elif sim.advection_scheme == 4:
             sim.step_weno(sim.rho, sim.rho_1, sim.rho_2, sim.new_rho, sim.dq_rho)
@@ -93,9 +87,7 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
 def main():
     schemes = {
         0: "Semi-Lagrangian",
-        1: "Upwind",
         2: "MacCormack",
-        3: "TVD (Minmod)",
         4: "WENO5"
     }
 

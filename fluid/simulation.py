@@ -25,6 +25,10 @@ class SimulationConfig:
     # values above ~1e-3 blow up over a few hundred steps. Purely artistic
     # anti-diffusion -- has no physical meaning.
     sharpen_strength: float = 0.0
+    # Advection scheme (also settable as a runtime attribute on the sim
+    # instance). 0 = Semi-Lagrangian, 2 = Selle-style MacCormack + clamp,
+    # 4 = WENO5 + SSP-RK3, 5 = Hybrid (WENO5 on vel, MacCormack on rho).
+    advection_scheme: int = 4
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
 
@@ -77,7 +81,9 @@ class FluidSimulation:
         self.div = ti.field(float, shape=(self.res, self.res))
 
         # Temp pressure field for Jacobi
-        self.advection_scheme = 4 # 0: Semi-Lagrangian, 2: MacCormack, 4: WENO5
+        # Advection scheme: 0 = Semi-Lagrangian, 2 = Selle-style MacCormack,
+        # 4 = WENO5, 5 = Hybrid (WENO on vel, MacCormack on rho).
+        self.advection_scheme = config.advection_scheme
 
         # RK3 intermediate fields
         self.rho_1 = ti.field(float, shape=(self.res, self.res))
@@ -759,6 +765,18 @@ class FluidSimulation:
         elif self.advection_scheme == 4:
             # WENO5 + SSP-RK3
             self.step_weno(self.rho, self.rho_1, self.rho_2, self.new_rho, self.dq_rho)
+            self.rho.copy_from(self.new_rho)
+            self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
+            self.vel.copy_from(self.new_vel)
+
+        elif self.advection_scheme == 5:
+            # Hybrid: WENO5 advects velocity (best fine-structure resolution),
+            # MacCormack-SL advects rho (clamp keeps sharp dye edges crisp).
+            # The two transports are independent; rho is done first so that
+            # it is advected by the current velocity, not the just-updated
+            # one (consistent with the other scheme dispatches).
+            self.advect_maccormack_predict(self.rho, self.predict_rho)
+            self.advect_maccormack_correct(self.rho, self.predict_rho, self.new_rho)
             self.rho.copy_from(self.new_rho)
             self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
             self.vel.copy_from(self.new_vel)
