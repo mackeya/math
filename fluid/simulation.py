@@ -459,6 +459,42 @@ class FluidSimulation:
             new_field[i, j] = ti.math.clamp(phi_corrected, lo, hi)
 
 
+    @ti.kernel
+    def sharpen_rho(self, strength: float):
+        """
+        Applies a single Laplacian-based unsharp pass to the dye field rho.
+
+        Computes the discrete 5-point Laplacian of rho and writes
+            new_rho[i, j] = rho[i, j] - strength * dt * laplacian(rho)[i, j]
+        into self.new_rho. The caller is responsible for copying new_rho back
+        into rho.
+
+        This is mathematically the heat equation run backwards in time with
+        coefficient `strength`. Anti-diffusion is unconditionally unstable in
+        the long run; this kernel is intended as a per-step edge enhancer on
+        features that advection has just smoothed, not as a standalone PDE
+        solver. Keep `strength` modest (single-digit values are typical) and
+        leave it at zero when sharpening isn't wanted (see SimulationConfig).
+
+        Honors the same periodic vs wall boundary convention as the rest of
+        the simulation.
+        """
+        for i, j in self.rho:
+            im1 = (i - 1) % self.res
+            ip1 = (i + 1) % self.res
+            jm1 = (j - 1) % self.res
+            jp1 = (j + 1) % self.res
+            if ti.static(self.bc_wall):
+                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
+                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
+            laplacian = (self.rho[ip1, j] + self.rho[im1, j]
+                         + self.rho[i, jp1] + self.rho[i, jm1]
+                         - 4.0 * self.rho[i, j]) / (self.dx * self.dx)
+            self.new_rho[i, j] = self.rho[i, j] - strength * self.dt * laplacian
+
+
     @ti.func
     def weno5_reconstruct(self, v1, v2, v3, v4, v5):
         eps = 1e-6
