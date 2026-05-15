@@ -96,9 +96,15 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
             sim.rho.fill(0.0)
             sim.splat_particles_to_rho()
         elif sim.advection_scheme == 8:
-            sim.advect_maccormack_predict(sim.backward_map, sim.predict_backward_map)
-            sim.advect_maccormack_correct(sim.backward_map, sim.predict_backward_map,
-                                          sim.new_backward_map)
+            # Mirror the step() dispatch so the test exercises whichever
+            # toggle state is configured (MacCormack vs WENO5 on delta).
+            if sim.cmm_use_weno_map_advection:
+                sim.step_weno(sim.backward_map, sim.delta_1, sim.delta_2,
+                              sim.new_backward_map, sim.dq_delta)
+            else:
+                sim.advect_maccormack_predict(sim.backward_map, sim.predict_backward_map)
+                sim.advect_maccormack_correct(sim.backward_map, sim.predict_backward_map,
+                                              sim.new_backward_map)
             sim._finalize_backward_map_step()
             sim.render_dye_from_backward_map()
 

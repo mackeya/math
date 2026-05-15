@@ -3,12 +3,12 @@
 
 
 ## For avoiding numerical diffusion
--- go lagrangian to some degree
 -- try vortex confinement
 
 Gemini suggests
 1. The "Coordinate Map" Trick (Lagrangian Texture Mapping)
-2. Lagrangian Particles (The "FLIP" Approach)
+    Holy shit it's really good!
+    Going further with this: submap
 3. Non-Linear "Sharpening" Kernels (The Anti-Diffusion Term)
     A common method is to add a term to your advection that pushes values toward the nearest "limit" (either 0 or 255):
     ∂t∂D​=⋯+λ⋅∇2D⋅(1−∣∇D∣)

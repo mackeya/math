@@ -51,6 +51,8 @@ def main():
     print("  Key 5: Hybrid (WENO vel + CIP rho)")
     print("  Key 6: Hybrid (WENO vel + Lagrangian particle rho)")
     print("  Key 7: Hybrid (WENO vel + Bidirectional CMM rho)")
+    print("  Key I: (CMM) cycle render interpolation (bilinear / Catmull-Rom / monotone-cubic)")
+    print("  Key A: (CMM) toggle map advection (MacCormack / WENO5)")
     print("  Key R: Reset Patterns")
     print("  Key F: Apply force to bottom half")
     print("  Key B: Toggle dye gravity (persistent)")
@@ -86,6 +88,10 @@ def main():
                     sim.advection_scheme = 7
                 elif gui.event.key == '7':
                     sim.advection_scheme = 8
+                elif gui.event.key == 'i':
+                    sim.cmm_render_mode = (sim.cmm_render_mode + 1) % 3
+                elif gui.event.key == 'a':
+                    sim.cmm_use_weno_map_advection = not sim.cmm_use_weno_map_advection
                 elif gui.event.key == 'r':
                     sim.time = 0.0
                     if config.init_type == 'patterns':
@@ -167,6 +173,15 @@ def main():
             cfl = sim.max_cfl()
             cfl_color = 0xFF3333 if cfl > 1.0 else 0xFFFFFF
             gui.text(f"max CFL: {cfl:.2f}", pos=(0.05, 0.75), color=cfl_color)
+            # CMM toggle states (only meaningful when scheme 8 is active).
+            # Temporary scaffolding for A/B-ing bilinear vs bicubic render
+            # and MacCormack vs WENO5 map advection.
+            if sim.advection_scheme == 8:
+                interp_labels = {0: "bilinear", 1: "catmull-rom", 2: "mono-cubic"}
+                interp_label = interp_labels[sim.cmm_render_mode]
+                adv_label = "WENO5" if sim.cmm_use_weno_map_advection else "MC-FC"
+                gui.text(f"CMM: render={interp_label}  map={adv_label}",
+                         pos=(0.05, 0.70), color=0xFFFFFF)
 
             # Recording indicator. Drawn after set_image so it appears in the
             # GUI window only; never enters the recorded video.

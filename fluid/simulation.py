@@ -141,9 +141,22 @@ class FluidSimulation:
         self.forward_map = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.predict_backward_map = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.new_backward_map = ti.Vector.field(2, float, shape=(self.res, self.res))
+        # WENO5 + SSP-RK3 scratch for advecting the backward_map delta.
+        # Only read when cmm_use_weno_map_advection is True. Kept separate
+        # from vel_1 / vel_2 / dq_vel so vel's own WENO step never collides.
+        self.delta_1 = ti.Vector.field(2, float, shape=(self.res, self.res))
+        self.delta_2 = ti.Vector.field(2, float, shape=(self.res, self.res))
+        self.dq_delta = ti.Vector.field(2, float, shape=(self.res, self.res))
         # 0-d accumulator for the max-self-consistency-error reduction.
         # Mirrors the pattern of self._max_vel_norm.
         self._map_distortion = ti.field(float, shape=())
+        # Temporary toggles for evaluating CMM quality variants. The
+        # render mode is a 3-state cycle (0=bilinear, 1=Catmull-Rom,
+        # 2=monotone-cubic / PCHIP-style); the advection toggle picks
+        # between MacCormack-FC and WENO5+SSP-RK3 for the delta field.
+        # Both will be removed once a permanent choice is made.
+        self.cmm_render_mode = 2          # 0 bilinear, 1 catmull-rom, 2 monotone-cubic
+        self.cmm_use_weno_map_advection = True
 
         # Scalar 0-d field used as the accumulator for the max-CFL reduction
         # in max_cfl(). Lives on the simulation so we don't allocate per call.
@@ -445,6 +458,158 @@ class FluidSimulation:
                f * (1 - g) * q[i1, j0] + \
                (1 - f) * g * q[i0, j1] + \
                f * g * q[i1, j1]
+
+    @ti.func
+    def cubic_sample(self, q, u, v):
+        """
+        Samples a field `q` at fractional coordinate (u, v) using a 4x4
+        Catmull-Rom cubic spline. Drop-in replacement for self.sample()
+        with the same (u, v) convention -- integer arguments coincide
+        with cell centers.
+
+        Catmull-Rom basis on [-1, 2] in local coords t:
+            b_{-1}(t) = -0.5 t (1 - t)^2
+            b_0   (t) = 1 + t^2 (1.5 t - 2.5)
+            b_1   (t) = 0.5 t (1 + t (4 - 3 t))
+            b_2   (t) = -0.5 t^2 (1 - t)
+        Tensor-product applied across rows then columns. Used by the CMM
+        render path when self.cmm_use_bicubic_render is True; sharper
+        than bilinear on smooth-image inputs at the cost of ~16 reads vs
+        4 and an extra ~30 fma ops.
+        """
+        i = int(ti.floor(u))
+        j = int(ti.floor(v))
+        fx = u - i
+        fy = v - j
+
+        # Catmull-Rom basis weights along x at the four sample columns
+        # (i-1, i, i+1, i+2). Same form along y.
+        bxm1 = -0.5 * fx * (1.0 - fx) * (1.0 - fx)
+        bx0  = 1.0 + fx * fx * (1.5 * fx - 2.5)
+        bx1  = 0.5 * fx * (1.0 + fx * (4.0 - 3.0 * fx))
+        bx2  = -0.5 * fx * fx * (1.0 - fx)
+        bym1 = -0.5 * fy * (1.0 - fy) * (1.0 - fy)
+        by0  = 1.0 + fy * fy * (1.5 * fy - 2.5)
+        by1  = 0.5 * fy * (1.0 + fy * (4.0 - 3.0 * fy))
+        by2  = -0.5 * fy * fy * (1.0 - fy)
+
+        # Index helpers honoring the same periodic / wall BC dispatch as
+        # the bilinear sample().
+        im1 = (i - 1) % self.res
+        i0  = i % self.res
+        ip1 = (i + 1) % self.res
+        ip2 = (i + 2) % self.res
+        jm1 = (j - 1) % self.res
+        j0  = j % self.res
+        jp1 = (j + 1) % self.res
+        jp2 = (j + 2) % self.res
+        if ti.static(self.bc_wall):
+            im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+            i0  = ti.math.clamp(i,     0, self.res - 1)
+            ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+            ip2 = ti.math.clamp(i + 2, 0, self.res - 1)
+            jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
+            j0  = ti.math.clamp(j,     0, self.res - 1)
+            jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
+            jp2 = ti.math.clamp(j + 2, 0, self.res - 1)
+
+        # 1D Catmull-Rom along each of the 4 contributing rows.
+        row_m1 = bxm1 * q[im1, jm1] + bx0 * q[i0, jm1] + bx1 * q[ip1, jm1] + bx2 * q[ip2, jm1]
+        row_0  = bxm1 * q[im1, j0 ] + bx0 * q[i0, j0 ] + bx1 * q[ip1, j0 ] + bx2 * q[ip2, j0 ]
+        row_p1 = bxm1 * q[im1, jp1] + bx0 * q[i0, jp1] + bx1 * q[ip1, jp1] + bx2 * q[ip2, jp1]
+        row_p2 = bxm1 * q[im1, jp2] + bx0 * q[i0, jp2] + bx1 * q[ip1, jp2] + bx2 * q[ip2, jp2]
+        return bym1 * row_m1 + by0 * row_0 + by1 * row_p1 + by2 * row_p2
+
+    @ti.func
+    def monotone_cubic_sample(self, q, u, v):
+        """
+        Samples a field `q` at fractional coordinate (u, v) using a
+        monotone cubic Hermite tensor product (PCHIP-style). Tangents
+        are estimated from local central differences and then passed
+        through `fc_limit` so the resulting cubic between any two
+        adjacent samples is provably monotone -- guaranteed no
+        overshoot, no Catmull-Rom-style ringing dips at sharp features.
+
+        Stencil: 4x4 cells (same footprint as Catmull-Rom). The cell
+        containing (u, v) is bracketed by columns i0..ip1 and rows
+        j0..jp1; tangents at those four bracketing samples require
+        the im1 / ip2 / jm1 / jp2 neighbors. Cost is comparable to
+        cubic_sample plus the FC limiter calls (10 limits total).
+
+        At local extrema (where the limiter zeroes the tangents) the
+        result degrades smoothly toward plain SL-like behavior. This
+        is the right trade-off for image content under flow: smooth
+        regions retain cubic crispness; sharp features stay clean
+        without grain.
+        """
+        i = int(ti.floor(u))
+        j = int(ti.floor(v))
+        fx = u - i
+        fy = v - j
+
+        # Standard Hermite basis at fx and fy.
+        Hx0 = 2.0 * fx * fx * fx - 3.0 * fx * fx + 1.0
+        Hx1 = fx * fx * fx - 2.0 * fx * fx + fx
+        Hx2 = -2.0 * fx * fx * fx + 3.0 * fx * fx
+        Hx3 = fx * fx * fx - fx * fx
+        Hy0 = 2.0 * fy * fy * fy - 3.0 * fy * fy + 1.0
+        Hy1 = fy * fy * fy - 2.0 * fy * fy + fy
+        Hy2 = -2.0 * fy * fy * fy + 3.0 * fy * fy
+        Hy3 = fy * fy * fy - fy * fy
+
+        # 4x4 stencil indices with periodic / wall BC dispatch.
+        im1 = (i - 1) % self.res
+        i0  = i % self.res
+        ip1 = (i + 1) % self.res
+        ip2 = (i + 2) % self.res
+        jm1 = (j - 1) % self.res
+        j0  = j % self.res
+        jp1 = (j + 1) % self.res
+        jp2 = (j + 2) % self.res
+        if ti.static(self.bc_wall):
+            im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+            i0  = ti.math.clamp(i,     0, self.res - 1)
+            ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+            ip2 = ti.math.clamp(i + 2, 0, self.res - 1)
+            jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
+            j0  = ti.math.clamp(j,     0, self.res - 1)
+            jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
+            jp2 = ti.math.clamp(j + 2, 0, self.res - 1)
+
+        # 1D monotone Hermite along each of the 4 contributing rows.
+        # Each row: estimate tangents via central differences at the two
+        # bracketing samples, FC-limit them against the secant, then
+        # evaluate the cubic at fx.
+        # Row j-1
+        a = q[im1, jm1]; b = q[i0, jm1]; c = q[ip1, jm1]; d = q[ip2, jm1]
+        sec = c - b
+        m0  = self.fc_limit(0.5 * (c - a), sec)
+        m1  = self.fc_limit(0.5 * (d - b), sec)
+        row_m1 = Hx0 * b + Hx1 * m0 + Hx2 * c + Hx3 * m1
+        # Row j
+        a = q[im1, j0]; b = q[i0, j0]; c = q[ip1, j0]; d = q[ip2, j0]
+        sec = c - b
+        m0  = self.fc_limit(0.5 * (c - a), sec)
+        m1  = self.fc_limit(0.5 * (d - b), sec)
+        row_0 = Hx0 * b + Hx1 * m0 + Hx2 * c + Hx3 * m1
+        # Row j+1
+        a = q[im1, jp1]; b = q[i0, jp1]; c = q[ip1, jp1]; d = q[ip2, jp1]
+        sec = c - b
+        m0  = self.fc_limit(0.5 * (c - a), sec)
+        m1  = self.fc_limit(0.5 * (d - b), sec)
+        row_p1 = Hx0 * b + Hx1 * m0 + Hx2 * c + Hx3 * m1
+        # Row j+2
+        a = q[im1, jp2]; b = q[i0, jp2]; c = q[ip1, jp2]; d = q[ip2, jp2]
+        sec = c - b
+        m0  = self.fc_limit(0.5 * (c - a), sec)
+        m1  = self.fc_limit(0.5 * (d - b), sec)
+        row_p2 = Hx0 * b + Hx1 * m0 + Hx2 * c + Hx3 * m1
+
+        # 1D monotone Hermite across the 4 row values in y.
+        sec_y = row_p1 - row_0
+        m0_y = self.fc_limit(0.5 * (row_p1 - row_m1), sec_y)
+        m1_y = self.fc_limit(0.5 * (row_p2 - row_0),  sec_y)
+        return Hy0 * row_0 + Hy1 * m0_y + Hy2 * row_p1 + Hy3 * m1_y
 
     @ti.kernel
     def _reduce_max_vel_norm(self):
@@ -989,15 +1154,8 @@ class FluidSimulation:
             self.forward_map[i, j] = y_new
 
     @ti.kernel
-    def render_dye_from_backward_map(self):
-        """
-        Reconstructs rho for the current frame by sampling rho_source at
-        X(x) = x + delta(x). This is the single bilinear interpolation
-        that makes CMM non-accumulating: regardless of how many advection
-        steps have passed since the last remap, the rendered rho is one
-        bilinear sample of the frozen source image. All inaccuracy lives
-        in the deformation field, not in the dye field.
-        """
+    def _render_dye_bilinear(self):
+        """Render variant: bilinear sampling of rho_source at X(x). Cheap."""
         for i, j in self.rho:
             cx = (i + 0.5) * self.dx
             cy = (j + 0.5) * self.dx
@@ -1005,6 +1163,47 @@ class FluidSimulation:
             self.rho[i, j] = self.sample(self.rho_source,
                                           src.x / self.dx - 0.5,
                                           src.y / self.dx - 0.5)
+
+    @ti.kernel
+    def _render_dye_bicubic(self):
+        """Render variant: Catmull-Rom bicubic sampling at X(x). Sharper."""
+        for i, j in self.rho:
+            cx = (i + 0.5) * self.dx
+            cy = (j + 0.5) * self.dx
+            src = ti.Vector([cx, cy]) + self.backward_map[i, j]
+            self.rho[i, j] = self.cubic_sample(self.rho_source,
+                                                src.x / self.dx - 0.5,
+                                                src.y / self.dx - 0.5)
+
+    @ti.kernel
+    def _render_dye_monotone_cubic(self):
+        """Render variant: PCHIP-style monotone cubic at X(x). Cubic-
+        crispness without Catmull-Rom's ringing dips."""
+        for i, j in self.rho:
+            cx = (i + 0.5) * self.dx
+            cy = (j + 0.5) * self.dx
+            src = ti.Vector([cx, cy]) + self.backward_map[i, j]
+            self.rho[i, j] = self.monotone_cubic_sample(self.rho_source,
+                                                        src.x / self.dx - 0.5,
+                                                        src.y / self.dx - 0.5)
+
+    def render_dye_from_backward_map(self):
+        """
+        Reconstructs rho for the current frame by sampling rho_source at
+        X(x) = x + delta(x). One interpolation per frame regardless of
+        how many advection steps have passed since the last remap, so
+        the rendered rho carries only single-interpolation error.
+        Dispatches between three render modes:
+            0 = bilinear (cheap, smooth, blurry)
+            1 = Catmull-Rom bicubic (sharp, but ringing at sharp features)
+            2 = monotone cubic (cubic crispness, no ringing)
+        """
+        if self.cmm_render_mode == 2:
+            self._render_dye_monotone_cubic()
+        elif self.cmm_render_mode == 1:
+            self._render_dye_bicubic()
+        else:
+            self._render_dye_bilinear()
 
     @ti.kernel
     def _compute_map_distortion(self):
@@ -1424,19 +1623,26 @@ class FluidSimulation:
 
         elif self.advection_scheme == 8:
             # Hybrid: WENO5 on vel + Bidirectional CMM on rho.
-            # 1) Advect the backward map X using MacCormack-FC. Reuses the
-            #    existing scheme-2 kernels, which are templated on field
-            #    type and work for vec2 inputs.
+            # 1) Advect the backward map X (stored as delta = X - x).
+            #    Dispatches between MacCormack-FC (2nd-order, cheaper) and
+            #    WENO5+SSP-RK3 (5th-order on smooth fields, ~3x cost) based
+            #    on cmm_use_weno_map_advection. WENO5 is near-exact on the
+            #    smooth delta field; dramatically reduces remap frequency.
             # 2) Advance the forward map Y by RK2 (Lagrangian trajectory).
-            # 3) Render rho by sampling rho_source at X. This is the
-            #    non-accumulating step: no matter how many frames have
-            #    passed since the last remap, rho is one bilinear sample
-            #    of the frozen source image.
+            # 3) Render rho by sampling rho_source at X. One interpolation
+            #    per frame regardless of step count -- bilinear or bicubic
+            #    based on cmm_use_bicubic_render.
             # 4) Velocity as usual.
             # Remap-trigger check happens at the end of step().
-            self.advect_maccormack_predict(self.backward_map, self.predict_backward_map)
-            self.advect_maccormack_correct(self.backward_map, self.predict_backward_map,
-                                            self.new_backward_map)
+            if self.cmm_use_weno_map_advection:
+                self.step_weno(self.backward_map, self.delta_1, self.delta_2,
+                                self.new_backward_map, self.dq_delta)
+            else:
+                self.advect_maccormack_predict(self.backward_map,
+                                                self.predict_backward_map)
+                self.advect_maccormack_correct(self.backward_map,
+                                                self.predict_backward_map,
+                                                self.new_backward_map)
             # Combine the copy-back with the per-step source term u*dt
             # that the delta-formulation of the backward-map update
             # requires (see _finalize_backward_map_step docstring).
