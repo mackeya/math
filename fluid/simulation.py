@@ -28,8 +28,19 @@ class SimulationConfig:
     # Advection scheme (also settable as a runtime attribute on the sim
     # instance). 0 = Semi-Lagrangian, 2 = Selle-style MacCormack + clamp,
     # 4 = WENO5 + SSP-RK3, 5 = Hybrid (WENO5 on vel, MacCormack on rho),
-    # 6 = Hybrid (WENO5 on vel, CIP cubic-Hermite SL on rho).
+    # 6 = Hybrid (WENO5 on vel, CIP cubic-Hermite SL on rho with FC limit),
+    # 7 = Hybrid (WENO5 on vel, passive Lagrangian particles on rho),
+    # 8 = Hybrid (WENO5 on vel, Bidirectional Characteristic Mapping on rho).
     advection_scheme: int = 4
+    # Remap trigger threshold for the Characteristic Mapping Method
+    # (advection_scheme == 8). When the maximum self-consistency error
+    # max |X(Y(x)) - x| of the bidirectional maps exceeds this many cell
+    # widths, the simulation bakes the current rho into rho_source and
+    # resets both maps to identity. Smaller = more frequent remaps (more
+    # grid-quantization, less visible map distortion); larger = less
+    # frequent (preserves smooth image quality longer, but eventually the
+    # map gets noticeably warped before snapping back). Units: cells (dx).
+    cmm_remap_threshold_cells: float = 1.0
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
 
@@ -108,6 +119,32 @@ class FluidSimulation:
         self.grad_rho = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.new_grad_rho = ti.Vector.field(2, float, shape=(self.res, self.res))
 
+        # Passive Lagrangian dye (advection_scheme == 7): one particle per
+        # grid cell at init. Each particle carries a position (physical, in
+        # [0, 1]^2) and a weight (the dye intensity it transports). The
+        # cells are re-built from particles each step via bilinear splatting.
+        self.n_particles = self.res * self.res
+        self.particle_pos = ti.Vector.field(2, float, shape=(self.n_particles,))
+        self.particle_weight = ti.field(float, shape=(self.n_particles,))
+
+        # Bidirectional Characteristic Mapping (advection_scheme == 8):
+        # rho_source is the frozen dye snapshot at the most recent remap.
+        # backward_map (X) maps current grid points back to their initial
+        # positions; advected by the velocity field each step. forward_map
+        # (Y) is the per-cell forward trajectory from the remap moment;
+        # used purely to detect when the maps have drifted enough that a
+        # remap is needed. Both maps are reset to the identity at remap.
+        # MacCormack predictor/corrector scratch for advecting X reuses
+        # the same kernels as the rest of the advection schemes.
+        self.rho_source = ti.field(float, shape=(self.res, self.res))
+        self.backward_map = ti.Vector.field(2, float, shape=(self.res, self.res))
+        self.forward_map = ti.Vector.field(2, float, shape=(self.res, self.res))
+        self.predict_backward_map = ti.Vector.field(2, float, shape=(self.res, self.res))
+        self.new_backward_map = ti.Vector.field(2, float, shape=(self.res, self.res))
+        # 0-d accumulator for the max-self-consistency-error reduction.
+        # Mirrors the pattern of self._max_vel_norm.
+        self._map_distortion = ti.field(float, shape=())
+
         # Scalar 0-d field used as the accumulator for the max-CFL reduction
         # in max_cfl(). Lives on the simulation so we don't allocate per call.
         self._max_vel_norm = ti.field(float, shape=())
@@ -152,12 +189,14 @@ class FluidSimulation:
     def init_patterns(self):
         """
         Initialize the dye field with the built-in checkerboard pattern and
-        seed the CIP gradient field so scheme 6 (CIP) starts from a
-        sensible state. Other schemes do not read grad_rho; the extra
-        kernel call is cheap and harmless when CIP is off.
+        seed the per-scheme auxiliary state (CIP gradient, particle pool,
+        CMM source + maps) so any scheme can be selected immediately. The
+        extra kernel calls are cheap when the targeted scheme is off.
         """
         self._init_patterns_kernel()
         self.init_grad_rho_from_rho()
+        self._init_particles_from_rho()
+        self._init_cmm_state_from_rho()
 
 
     def init_from_image(self, image_path: str):
@@ -189,9 +228,11 @@ class FluidSimulation:
         self.rho.from_numpy(dye_np)
         if self.bc_absorbing:
             self.apply_absorbing_rho_bc()
-        # Seed CIP gradient field from the loaded rho. No-op cost for other
-        # schemes; the gradient is read only by advect_cip.
+        # Seed per-scheme auxiliary state from the loaded rho. No-op cost
+        # for schemes that don't read these.
         self.init_grad_rho_from_rho()
+        self._init_particles_from_rho()
+        self._init_cmm_state_from_rho()
 
     @ti.kernel
     def _fill_dye_kernel(self, x: float, y: float, radius: float, amount: float):
@@ -214,12 +255,21 @@ class FluidSimulation:
 
     def fill_dye(self, x: float, y: float, radius: float, amount: float):
         """
-        Adds dye in a circular region around (x, y). Also refreshes the CIP
-        gradient field via central differences so newly-injected dye is
-        immediately advected with its correct gradient under scheme 6.
+        Adds dye in a circular region around (x, y). In Eulerian modes this
+        writes to the grid rho field and refreshes the CIP gradient. In
+        particle mode (scheme 7) this adds to the weight of every particle
+        in the affected disk. In CMM mode (scheme 8) it projects each
+        affected current-frame cell through the backward map and deposits
+        the dye into rho_source at the back-traced location, so the new
+        dye participates in the existing map without forcing a remap.
         """
-        self._fill_dye_kernel(x, y, radius, amount)
-        self.init_grad_rho_from_rho()
+        if self.advection_scheme == 8:
+            self._fill_dye_cmm_kernel(x, y, radius, amount)
+        elif self.advection_scheme == 7:
+            self._fill_dye_particles_kernel(x, y, radius, amount)
+        else:
+            self._fill_dye_kernel(x, y, radius, amount)
+            self.init_grad_rho_from_rho()
 
     @ti.kernel
     def apply_force(self, x: float, y: float, f_x: float, f_y: float, radius: float):
@@ -750,6 +800,292 @@ class FluidSimulation:
 
 
     @ti.kernel
+    def _init_particles_from_rho(self):
+        """
+        Initializes the passive-Lagrangian dye particles from the current
+        rho field. One particle per grid cell: position = cell center,
+        weight = rho value at that cell. Called from init_patterns,
+        init_from_image, and any other code path that authoritatively sets
+        rho. The particle layout is the same independent of bc_type; only
+        the per-step advection differs.
+        """
+        for i, j in self.rho:
+            p_idx = i * self.res + j
+            self.particle_pos[p_idx] = ti.Vector([(i + 0.5) * self.dx,
+                                                   (j + 0.5) * self.dx])
+            self.particle_weight[p_idx] = self.rho[i, j]
+
+    @ti.kernel
+    def advect_particles_rk2(self):
+        """
+        Advances every particle one step via the RK2 midpoint method:
+            u0    = vel(x)
+            x_mid = x + 0.5 * dt * u0
+            u_mid = vel(x_mid)
+            x_new = x + dt * u_mid
+        Velocity is sampled from the simulation's grid via bilinear
+        interpolation (the existing `sample()` helper).
+
+        Boundary conditions: periodic wrap when bc_type='periodic',
+        clamp-to-edge otherwise. Particles are never removed; "absorbing"
+        only kills dye when the splat step writes the boundary rows of
+        rho to zero in apply_absorbing_rho_bc.
+        """
+        for p in range(self.n_particles):
+            x = self.particle_pos[p]
+            # sample() expects coords where integer == cell index;
+            # particle.pos is in physical units. Convert: cell-center coord
+            # = pos / dx, sample arg = cell-center coord - 0.5.
+            u0 = self.sample(self.vel, x.x / self.dx - 0.5, x.y / self.dx - 0.5)
+            x_mid = x + 0.5 * self.dt * u0
+            u_mid = self.sample(self.vel,
+                                x_mid.x / self.dx - 0.5,
+                                x_mid.y / self.dx - 0.5)
+            x_new = x + self.dt * u_mid
+
+            if ti.static(self.bc_wall):
+                x_new.x = ti.math.clamp(x_new.x, 0.0, 1.0)
+                x_new.y = ti.math.clamp(x_new.y, 0.0, 1.0)
+            else:
+                # Periodic wrap to [0, 1). Subtracting floor handles negative
+                # values correctly (Taichi's % follows the dividend's sign).
+                x_new.x = x_new.x - ti.floor(x_new.x)
+                x_new.y = x_new.y - ti.floor(x_new.y)
+            self.particle_pos[p] = x_new
+
+    @ti.kernel
+    def splat_particles_to_rho(self):
+        """
+        Bilinearly deposits each particle's weight into the four nearest
+        rho cells. Caller is responsible for zeroing rho before calling
+        (so multiple sources can be splatted into the same field if
+        desired). Atomic adds make the splat parallel-safe across particles
+        that happen to land in the same cell.
+        """
+        for p in range(self.n_particles):
+            x = self.particle_pos[p]
+            w = self.particle_weight[p]
+            u = x.x / self.dx - 0.5
+            v = x.y / self.dx - 0.5
+            i_b = int(ti.floor(u))
+            j_b = int(ti.floor(v))
+            fx = u - i_b
+            fy = v - j_b
+
+            i0 = i_b % self.res
+            i1 = (i_b + 1) % self.res
+            j0 = j_b % self.res
+            j1 = (j_b + 1) % self.res
+            if ti.static(self.bc_wall):
+                i0 = ti.math.clamp(i_b,     0, self.res - 1)
+                i1 = ti.math.clamp(i_b + 1, 0, self.res - 1)
+                j0 = ti.math.clamp(j_b,     0, self.res - 1)
+                j1 = ti.math.clamp(j_b + 1, 0, self.res - 1)
+
+            ti.atomic_add(self.rho[i0, j0], (1.0 - fx) * (1.0 - fy) * w)
+            ti.atomic_add(self.rho[i1, j0], fx         * (1.0 - fy) * w)
+            ti.atomic_add(self.rho[i0, j1], (1.0 - fx) * fy         * w)
+            ti.atomic_add(self.rho[i1, j1], fx         * fy         * w)
+
+    @ti.kernel
+    def _fill_dye_particles_kernel(self, x: float, y: float,
+                                   radius: float, amount: float):
+        """
+        Particle-mode equivalent of `_fill_dye_kernel`. Adds `amount` to
+        the weight of every particle whose current position is within
+        `radius` of (x, y). Total dye injected per click depends on local
+        particle density, which under sustained flow can vary somewhat
+        from the uniform grid-equivalent. Acceptable trade-off for v1.
+        """
+        for p in range(self.n_particles):
+            pos = self.particle_pos[p]
+            dist_x = ti.abs(pos.x - x)
+            dist_y = ti.abs(pos.y - y)
+            if ti.static(not self.bc_wall):
+                if dist_x > 0.5: dist_x = 1.0 - dist_x
+                if dist_y > 0.5: dist_y = 1.0 - dist_y
+            dist = ti.sqrt(dist_x * dist_x + dist_y * dist_y)
+            if dist < radius:
+                self.particle_weight[p] += amount
+
+
+    @ti.kernel
+    def _init_cmm_state_from_rho(self):
+        """
+        Seeds the Bidirectional CMM state from the current rho field:
+          - rho_source <- rho
+          - backward_map[i, j] = (0, 0)         (zero deformation)
+          - forward_map[i, j] = cell_center(i, j)  (identity)
+        backward_map stores the deformation delta(x) = X(x) - x rather
+        than the absolute back-traced coordinate; this makes the field
+        continuous across periodic boundaries (otherwise the field would
+        have a step jump of size 1 at the seam, which MacCormack's
+        bilinear interpolation cannot handle correctly).
+        """
+        for i, j in self.rho:
+            self.rho_source[i, j] = self.rho[i, j]
+            self.backward_map[i, j] = ti.Vector([0.0, 0.0])
+            cx = (i + 0.5) * self.dx
+            cy = (j + 0.5) * self.dx
+            self.forward_map[i, j] = ti.Vector([cx, cy])
+
+    @ti.kernel
+    def _init_cmm_maps_to_identity(self):
+        """
+        Resets the bidirectional CMM maps after a remap. backward_map
+        (the deformation) goes to zero; forward_map (the absolute
+        Lagrangian position) goes to cell center. rho_source is left
+        untouched; the caller has already updated it.
+        """
+        for i, j in self.backward_map:
+            self.backward_map[i, j] = ti.Vector([0.0, 0.0])
+            cx = (i + 0.5) * self.dx
+            cy = (j + 0.5) * self.dx
+            self.forward_map[i, j] = ti.Vector([cx, cy])
+
+    @ti.kernel
+    def _finalize_backward_map_step(self):
+        """
+        Post-advection step for the backward map: copy MacCormack output
+        into backward_map AND subtract the source term u*dt. This source
+        term comes from rewriting the standard backward-map update
+            X^{n+1}(x) = X^n(x - u dt)
+        in terms of delta = X - x:
+            delta^{n+1}(x) = delta^n(x - u dt) - u(x) dt
+        where the first part is plain advection of delta (handled by the
+        preceding MacCormack pair) and the second part is the per-cell
+        source term applied here.
+        """
+        for i, j in self.backward_map:
+            self.backward_map[i, j] = (self.new_backward_map[i, j]
+                                        - self.dt * self.vel[i, j])
+
+    @ti.kernel
+    def advect_forward_map_rk2(self):
+        """
+        Advance the forward map Y one step via RK2 midpoint integration.
+        Y[i, j] tracks the current position of the particle that was at
+        cell (i, j) at the most recent remap.
+
+        Under periodic BCs we do NOT wrap Y back into [0, 1) -- letting
+        the absolute value drift over time makes the consistency check
+        cleaner, because the backward delta is sampled at Y modulo 1
+        anyway (sample() wraps the index), and the rho_source sampling
+        composes naturally without modular arithmetic. Under wall BCs we
+        clamp Y to the domain like everything else.
+        """
+        for i, j in self.forward_map:
+            y = self.forward_map[i, j]
+            u0 = self.sample(self.vel, y.x / self.dx - 0.5, y.y / self.dx - 0.5)
+            y_mid = y + 0.5 * self.dt * u0
+            u_mid = self.sample(self.vel,
+                                y_mid.x / self.dx - 0.5,
+                                y_mid.y / self.dx - 0.5)
+            y_new = y + self.dt * u_mid
+            if ti.static(self.bc_wall):
+                y_new.x = ti.math.clamp(y_new.x, 0.0, 1.0)
+                y_new.y = ti.math.clamp(y_new.y, 0.0, 1.0)
+            # Periodic case: do not wrap; let absolute position accumulate.
+            self.forward_map[i, j] = y_new
+
+    @ti.kernel
+    def render_dye_from_backward_map(self):
+        """
+        Reconstructs rho for the current frame by sampling rho_source at
+        X(x) = x + delta(x). This is the single bilinear interpolation
+        that makes CMM non-accumulating: regardless of how many advection
+        steps have passed since the last remap, the rendered rho is one
+        bilinear sample of the frozen source image. All inaccuracy lives
+        in the deformation field, not in the dye field.
+        """
+        for i, j in self.rho:
+            cx = (i + 0.5) * self.dx
+            cy = (j + 0.5) * self.dx
+            src = ti.Vector([cx, cy]) + self.backward_map[i, j]
+            self.rho[i, j] = self.sample(self.rho_source,
+                                          src.x / self.dx - 0.5,
+                                          src.y / self.dx - 0.5)
+
+    @ti.kernel
+    def _compute_map_distortion(self):
+        """
+        Reduction kernel: max over all cells of ||X(Y(x)) - x||, the
+        bidirectional-map self-consistency error. With X = id + delta:
+            X(Y(x)) - x = (Y(x) + delta(Y(x))) - x
+        where delta(Y) is bilinearly sampled from backward_map at Y mod 1
+        (via sample()). When the maps are perfect inverses, this is zero.
+        Drift past the configured threshold triggers a remap.
+        """
+        self._map_distortion[None] = 0.0
+        for i, j in self.forward_map:
+            x_grid = ti.Vector([(i + 0.5) * self.dx, (j + 0.5) * self.dx])
+            y_fwd = self.forward_map[i, j]
+            delta_at_yfwd = self.sample(self.backward_map,
+                                         y_fwd.x / self.dx - 0.5,
+                                         y_fwd.y / self.dx - 0.5)
+            x_recovered = y_fwd + delta_at_yfwd
+            err = (x_recovered - x_grid).norm()
+            ti.atomic_max(self._map_distortion[None], err)
+
+    @ti.kernel
+    def _fill_dye_cmm_kernel(self, x: float, y: float,
+                             radius: float, amount: float):
+        """
+        CMM-mode dye injection. The click location is in current (post-
+        deformation) world space, but rho_source lives in pre-deformation
+        space. For each cell within radius of the click, project its
+        centre through the backward map to get the corresponding source-
+        space location, then bilinearly deposit `amount` into rho_source
+        at that location. After this kernel returns, normal CMM rendering
+        produces dye at the click location -- and the new dye is then
+        carried by the same backward map as everything else.
+        """
+        for i, j in self.rho:
+            cx = (i + 0.5) * self.dx
+            cy = (j + 0.5) * self.dx
+            dist_x = ti.abs(cx - x)
+            dist_y = ti.abs(cy - y)
+            if ti.static(not self.bc_wall):
+                if dist_x > 0.5: dist_x = 1.0 - dist_x
+                if dist_y > 0.5: dist_y = 1.0 - dist_y
+            dist = ti.sqrt(dist_x * dist_x + dist_y * dist_y)
+            if dist < radius:
+                src = ti.Vector([cx, cy]) + self.backward_map[i, j]
+                u = src.x / self.dx - 0.5
+                v = src.y / self.dx - 0.5
+                i_b = int(ti.floor(u))
+                j_b = int(ti.floor(v))
+                fx = u - i_b
+                fy = v - j_b
+
+                i0 = i_b % self.res
+                i1 = (i_b + 1) % self.res
+                j0 = j_b % self.res
+                j1 = (j_b + 1) % self.res
+                if ti.static(self.bc_wall):
+                    i0 = ti.math.clamp(i_b,     0, self.res - 1)
+                    i1 = ti.math.clamp(i_b + 1, 0, self.res - 1)
+                    j0 = ti.math.clamp(j_b,     0, self.res - 1)
+                    j1 = ti.math.clamp(j_b + 1, 0, self.res - 1)
+
+                ti.atomic_add(self.rho_source[i0, j0], (1.0 - fx) * (1.0 - fy) * amount)
+                ti.atomic_add(self.rho_source[i1, j0], fx         * (1.0 - fy) * amount)
+                ti.atomic_add(self.rho_source[i0, j1], (1.0 - fx) * fy         * amount)
+                ti.atomic_add(self.rho_source[i1, j1], fx         * fy         * amount)
+
+    def cmm_remap(self):
+        """
+        Bake the current rho into rho_source and reset both maps to the
+        identity. Called from `step()` when the bidirectional consistency
+        check indicates the maps have drifted past the configured
+        threshold. Visually this is a one-frame "snapshot" of the current
+        dye state at grid resolution.
+        """
+        self.rho_source.copy_from(self.rho)
+        self._init_cmm_maps_to_identity()
+
+
+    @ti.kernel
     def sharpen_rho(self, strength: float):
         """
         Applies a single Laplacian-based unsharp pass to the dye field rho.
@@ -1073,6 +1409,43 @@ class FluidSimulation:
             self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
             self.vel.copy_from(self.new_vel)
 
+        elif self.advection_scheme == 7:
+            # Hybrid: WENO5 on vel + passive Lagrangian particles on rho.
+            # Particles are advected by sampling the grid velocity (RK2
+            # midpoint), then bilinear-splatted back into rho so that
+            # rendering and rho-dependent forces continue to work
+            # unchanged. The rho.fill(0) is necessary because the splat
+            # accumulates atomically; otherwise old values would persist.
+            self.advect_particles_rk2()
+            self.rho.fill(0.0)
+            self.splat_particles_to_rho()
+            self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
+            self.vel.copy_from(self.new_vel)
+
+        elif self.advection_scheme == 8:
+            # Hybrid: WENO5 on vel + Bidirectional CMM on rho.
+            # 1) Advect the backward map X using MacCormack-FC. Reuses the
+            #    existing scheme-2 kernels, which are templated on field
+            #    type and work for vec2 inputs.
+            # 2) Advance the forward map Y by RK2 (Lagrangian trajectory).
+            # 3) Render rho by sampling rho_source at X. This is the
+            #    non-accumulating step: no matter how many frames have
+            #    passed since the last remap, rho is one bilinear sample
+            #    of the frozen source image.
+            # 4) Velocity as usual.
+            # Remap-trigger check happens at the end of step().
+            self.advect_maccormack_predict(self.backward_map, self.predict_backward_map)
+            self.advect_maccormack_correct(self.backward_map, self.predict_backward_map,
+                                            self.new_backward_map)
+            # Combine the copy-back with the per-step source term u*dt
+            # that the delta-formulation of the backward-map update
+            # requires (see _finalize_backward_map_step docstring).
+            self._finalize_backward_map_step()
+            self.advect_forward_map_rk2()
+            self.render_dye_from_backward_map()
+            self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
+            self.vel.copy_from(self.new_vel)
+
         # Optional per-step Laplacian-based unsharp pass on the dye field.
         # Default-off via SimulationConfig.sharpen_strength = 0.0. When on,
         # acts as artistic anti-diffusion -- see the sharpen_rho docstring.
@@ -1120,3 +1493,15 @@ class FluidSimulation:
 
         if self.bc_wall and not self.bc_open:
             self.apply_velocity_bc()
+
+        # CMM remap trigger. After the full step finishes, check the
+        # bidirectional consistency error; if the maps have drifted more
+        # than `cmm_remap_threshold_cells * dx`, bake the current rho into
+        # rho_source and reset both maps to identity. This is the only
+        # time the dye gets re-quantized to grid resolution; between
+        # remaps the source image is read pixel-perfect via one bilinear.
+        if self.advection_scheme == 8:
+            self._compute_map_distortion()
+            threshold = self.config.cmm_remap_threshold_cells * self.dx
+            if float(self._map_distortion[None]) > threshold:
+                self.cmm_remap()

@@ -67,6 +67,12 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
     # central differences before the time loop.
     if sim.advection_scheme == 6:
         sim.init_grad_rho_from_rho()
+    # Scheme 7 (particles) needs the particle state seeded from rho.
+    if sim.advection_scheme == 7:
+        sim._init_particles_from_rho()
+    # Scheme 8 (Bidirectional CMM) needs rho_source seeded and maps reset.
+    if sim.advection_scheme == 8:
+        sim._init_cmm_state_from_rho()
 
     steps = int(T / dt)
     for _ in range(steps):
@@ -85,6 +91,16 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
             sim.advect_cip(sim.rho, sim.grad_rho, sim.new_rho, sim.new_grad_rho)
             sim.rho.copy_from(sim.new_rho)
             sim.grad_rho.copy_from(sim.new_grad_rho)
+        elif sim.advection_scheme == 7:
+            sim.advect_particles_rk2()
+            sim.rho.fill(0.0)
+            sim.splat_particles_to_rho()
+        elif sim.advection_scheme == 8:
+            sim.advect_maccormack_predict(sim.backward_map, sim.predict_backward_map)
+            sim.advect_maccormack_correct(sim.backward_map, sim.predict_backward_map,
+                                          sim.new_backward_map)
+            sim._finalize_backward_map_step()
+            sim.render_dye_from_backward_map()
 
     # Compute error
     rho_num = sim.rho.to_numpy()
@@ -99,6 +115,8 @@ def main():
         2: "MacCormack",
         4: "WENO5",
         6: "CIP",
+        7: "Particles",
+        8: "CMM",
     }
 
     resolutions = [32, 64, 128, 256]
