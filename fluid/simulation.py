@@ -27,17 +27,9 @@ class SimulationConfig:
     sharpen_strength: float = 0.0
     # Advection scheme (also settable as a runtime attribute on the sim
     # instance). 0 = Semi-Lagrangian, 2 = Selle-style MacCormack + clamp,
-    # 4 = WENO5 + SSP-RK3, 5 = Hybrid (WENO5 on vel, MacCormack on rho).
+    # 4 = WENO5 + SSP-RK3, 5 = Hybrid (WENO5 on vel, MacCormack on rho),
+    # 6 = Hybrid (WENO5 on vel, CIP cubic-Hermite SL on rho).
     advection_scheme: int = 4
-    # Donor neighborhood width for the MacCormack extrema clamp. 2 = the
-    # standard bilinear support (4 cells) at the back-traced location.
-    # 3 = a 3x3 stencil (9 cells) around the lower-left bilinear cell;
-    # includes the bilinear support plus 5 surrounding cells. The wider
-    # stencil reduces ringing at sharp gradients by triggering the
-    # fallback-to-SL path less often, at roughly 2x the clamp's memory
-    # traffic. Only affects advection_scheme 2 and 5. Runtime-switchable
-    # via sim.maccormack_clamp_width.
-    maccormack_clamp_width: int = 2
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
 
@@ -93,11 +85,6 @@ class FluidSimulation:
         # Advection scheme: 0 = Semi-Lagrangian, 2 = Selle-style MacCormack,
         # 4 = WENO5, 5 = Hybrid (WENO on vel, MacCormack on rho).
         self.advection_scheme = config.advection_scheme
-        # MacCormack clamp donor neighborhood width (2 or 3). Runtime-
-        # switchable; the corrector kernel is specialized per value so the
-        # switch triggers one extra kernel compile the first time each
-        # value is used.
-        self.maccormack_clamp_width = config.maccormack_clamp_width
 
         # RK3 intermediate fields
         self.rho_1 = ti.field(float, shape=(self.res, self.res))
@@ -114,6 +101,13 @@ class FluidSimulation:
         self.predict_rho = ti.field(float, shape=(self.res, self.res))
         self.predict_vel = ti.Vector.field(2, float, shape=(self.res, self.res))
 
+        # CIP (advection_scheme == 6): gradient of rho is transported alongside
+        # rho itself, enabling cubic-Hermite reconstruction during advection.
+        # Vector field with .x = d rho / dx, .y = d rho / dy. new_grad_rho is
+        # the corrector scratch; the caller swaps after each CIP step.
+        self.grad_rho = ti.Vector.field(2, float, shape=(self.res, self.res))
+        self.new_grad_rho = ti.Vector.field(2, float, shape=(self.res, self.res))
+
         # Scalar 0-d field used as the accumulator for the max-CFL reduction
         # in max_cfl(). Lives on the simulation so we don't allocate per call.
         self._max_vel_norm = ti.field(float, shape=())
@@ -129,10 +123,13 @@ class FluidSimulation:
         self.bc_open = (config.bc_type == 'open')
 
     @ti.kernel
-    def init_patterns(self):
+    def _init_patterns_kernel(self):
         """
-        Initializes the velocity, pressure, and density (dye) fields to zero,
-        and sets up a starting dye pattern consisting of a grid and a central circle.
+        Kernel body for `init_patterns`. Sets velocity, pressure, and dye
+        fields to zero, then paints the starting dye pattern (a grid of
+        bright squares symmetric around the center). Kept separate from the
+        Python `init_patterns` wrapper so that wrapper can also seed the CIP
+        gradient field by calling another kernel after this one.
         """
         self.rho.fill(0)
         self.vel.fill(0)
@@ -151,6 +148,16 @@ class FluidSimulation:
             # boundary = self.res / 2 + ti.cos((i * self.dx * 2.0 - 1.0) * np.pi) * self.res * 0.1
             # if j < boundary:
             #     self.rho[i, j] = 1.0
+
+    def init_patterns(self):
+        """
+        Initialize the dye field with the built-in checkerboard pattern and
+        seed the CIP gradient field so scheme 6 (CIP) starts from a
+        sensible state. Other schemes do not read grad_rho; the extra
+        kernel call is cheap and harmless when CIP is off.
+        """
+        self._init_patterns_kernel()
+        self.init_grad_rho_from_rho()
 
 
     def init_from_image(self, image_path: str):
@@ -182,12 +189,16 @@ class FluidSimulation:
         self.rho.from_numpy(dye_np)
         if self.bc_absorbing:
             self.apply_absorbing_rho_bc()
+        # Seed CIP gradient field from the loaded rho. No-op cost for other
+        # schemes; the gradient is read only by advect_cip.
+        self.init_grad_rho_from_rho()
 
     @ti.kernel
-    def fill_dye(self, x: float, y: float, radius: float, amount: float):
+    def _fill_dye_kernel(self, x: float, y: float, radius: float, amount: float):
         """
-        Adds dye (or a density scalar field) to the fluid in a circular region.
-        Equation: ρ(x, y) = ρ(x, y) + amount (for points within the specified radius)
+        Kernel body for `fill_dye`. Adds dye in a circular region without
+        touching grad_rho; the Python wrapper refreshes the CIP gradient
+        afterward.
         """
         for i, j in self.rho:
             dist_x = abs(i * self.dx - x)
@@ -200,6 +211,15 @@ class FluidSimulation:
             dist = ti.sqrt(dist_x * dist_x + dist_y * dist_y)
             if dist < radius:
                 self.rho[i, j] += amount
+
+    def fill_dye(self, x: float, y: float, radius: float, amount: float):
+        """
+        Adds dye in a circular region around (x, y). Also refreshes the CIP
+        gradient field via central differences so newly-injected dye is
+        immediately advected with its correct gradient under scheme 6.
+        """
+        self._fill_dye_kernel(x, y, radius, amount)
+        self.init_grad_rho_from_rho()
 
     @ti.kernel
     def apply_force(self, x: float, y: float, f_x: float, f_y: float, radius: float):
@@ -440,8 +460,7 @@ class FluidSimulation:
     @ti.kernel
     def advect_maccormack_correct(self, field: ti.template(),
                                   phi_hat: ti.template(),
-                                  new_field: ti.template(),
-                                  clamp_width: ti.template()):
+                                  new_field: ti.template()):
         """
         Corrector step of the Selle-style semi-Lagrangian MacCormack scheme.
 
@@ -457,21 +476,13 @@ class FluidSimulation:
                   phi_corrected = phi_hat[x] + 0.5 * (field[x] - phi_hat_hat)
            which removes the predictor's leading-order bias.
 
-        3. Compute the donor neighborhood [lo, hi] around the back-traced
-           location x_back = x - u(x)*dt. With clamp_width=2 this is the
-           bilinear support (4 cells); with clamp_width=3 it is the 3x3
-           stencil (9 cells) that includes the bilinear support plus 5
-           surrounding cells. The wider stencil reduces ringing at sharp
-           gradients by triggering the fallback path less often.
+        3. Compute the donor neighborhood [lo, hi] over the bilinear support
+           (4 cells) at the back-traced location x_back = x - u(x)*dt.
 
         4. Modified MacCormack: if phi_corrected lies inside [lo, hi], use
            it; otherwise fall back to phi_hat[x] (the safe SL value). The
            fallback avoids the stair-step / halo artifacts that hard
            clamping to the [lo, hi] boundary produces.
-
-        `clamp_width` is a `ti.template()` argument, so Taichi specializes
-        the kernel per value (2 or 3) -- the branch below is resolved at
-        compile time and costs nothing per cell at runtime.
 
         Honors periodic vs wall boundary conditions through the same dispatch
         used elsewhere in the file. Reference: Selle, Fedkiw, Kim, Liu,
@@ -494,49 +505,24 @@ class FluidSimulation:
             i_b = int(ti.floor(p_back.x - 0.5))
             j_b = int(ti.floor(p_back.y - 0.5))
 
-            # Donor neighborhood [lo, hi]. Both branches use component-wise
-            # min/max which works identically for scalar and 2-vector fields.
-            lo = field[i, j]   # placeholder; overwritten below
-            hi = field[i, j]
-            if ti.static(clamp_width == 3):
-                # 3x3 donor stencil from (i_b-1, j_b-1) to (i_b+1, j_b+1):
-                # the 4 bilinear support cells plus 5 surrounding cells.
-                # Initialize lo/hi from the lower-left of the stencil, then
-                # expand to cover all 9 cells.
-                i_init = (i_b - 1) % self.res
-                j_init = (j_b - 1) % self.res
-                if ti.static(self.bc_wall):
-                    i_init = ti.math.clamp(i_b - 1, 0, self.res - 1)
-                    j_init = ti.math.clamp(j_b - 1, 0, self.res - 1)
-                lo = field[i_init, j_init]
-                hi = lo
-                for di in ti.static(range(-1, 2)):
-                    for dj in ti.static(range(-1, 2)):
-                        ii = (i_b + di) % self.res
-                        jj = (j_b + dj) % self.res
-                        if ti.static(self.bc_wall):
-                            ii = ti.math.clamp(i_b + di, 0, self.res - 1)
-                            jj = ti.math.clamp(j_b + dj, 0, self.res - 1)
-                        v = field[ii, jj]
-                        lo = ti.min(lo, v)
-                        hi = ti.max(hi, v)
-            else:
-                # 2x2 donor stencil: the predictor's bilinear support.
-                i0 = i_b % self.res
-                i1 = (i_b + 1) % self.res
-                j0 = j_b % self.res
-                j1 = (j_b + 1) % self.res
-                if ti.static(self.bc_wall):
-                    i0 = ti.math.clamp(i_b,     0, self.res - 1)
-                    i1 = ti.math.clamp(i_b + 1, 0, self.res - 1)
-                    j0 = ti.math.clamp(j_b,     0, self.res - 1)
-                    j1 = ti.math.clamp(j_b + 1, 0, self.res - 1)
-                v00 = field[i0, j0]
-                v10 = field[i1, j0]
-                v01 = field[i0, j1]
-                v11 = field[i1, j1]
-                lo = ti.min(ti.min(v00, v10), ti.min(v01, v11))
-                hi = ti.max(ti.max(v00, v10), ti.max(v01, v11))
+            # 2x2 donor stencil: the predictor's bilinear support.
+            # Component-wise min/max works for scalar and 2-vector fields,
+            # which is how the same kernel can advect both rho and vel.
+            i0 = i_b % self.res
+            i1 = (i_b + 1) % self.res
+            j0 = j_b % self.res
+            j1 = (j_b + 1) % self.res
+            if ti.static(self.bc_wall):
+                i0 = ti.math.clamp(i_b,     0, self.res - 1)
+                i1 = ti.math.clamp(i_b + 1, 0, self.res - 1)
+                j0 = ti.math.clamp(j_b,     0, self.res - 1)
+                j1 = ti.math.clamp(j_b + 1, 0, self.res - 1)
+            v00 = field[i0, j0]
+            v10 = field[i1, j0]
+            v01 = field[i0, j1]
+            v11 = field[i1, j1]
+            lo = ti.min(ti.min(v00, v10), ti.min(v01, v11))
+            hi = ti.max(ti.max(v00, v10), ti.max(v01, v11))
 
             # Modified MacCormack: if the corrected value would have been
             # clamped, fall back to the safe semi-Lagrangian predictor
@@ -547,6 +533,220 @@ class FluidSimulation:
             new_field[i, j] = ti.select(
                 clamped == phi_corrected, phi_corrected, phi_hat[i, j]
             )
+
+
+    @ti.kernel
+    def init_grad_rho_from_rho(self):
+        """
+        Computes grad_rho = nabla rho via central differences. Used to seed
+        the CIP gradient field after rho is set by an init method or by
+        fill_dye, so the CIP advection has a sensible starting gradient.
+        Honors periodic vs wall boundary conditions.
+        """
+        for i, j in self.rho:
+            im1 = (i - 1) % self.res
+            ip1 = (i + 1) % self.res
+            jm1 = (j - 1) % self.res
+            jp1 = (j + 1) % self.res
+            if ti.static(self.bc_wall):
+                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
+                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
+            gx = (self.rho[ip1, j] - self.rho[im1, j]) * 0.5 / self.dx
+            gy = (self.rho[i, jp1] - self.rho[i, jm1]) * 0.5 / self.dx
+            self.grad_rho[i, j] = ti.Vector([gx, gy])
+
+
+    @ti.func
+    def fc_limit(self, g: float, secant: float) -> float:
+        """
+        Fritsch-Carlson monotone-cubic limit for a Hermite tangent.
+
+        Given a cell-coord secant slope `secant` between two adjacent samples
+        and a stored tangent `g` at one of them (both in cell-coord units),
+        returns g clamped so the cubic Hermite over the cell is provably
+        monotone: tangent must share sign with the secant and its magnitude
+        must not exceed 3 * |secant|. If the secant is zero or the tangent
+        sign disagrees with it, the tangent is zeroed (this enforces local
+        extrema at sample points and prevents the cubic from creating new
+        ones). Reference: Fritsch, Carlson (1980) "Monotone Piecewise Cubic
+        Interpolation", SIAM J. Numer. Anal.
+        """
+        result = 0.0
+        if secant * g > 0.0:
+            # Tangent shares sign with the secant; cap magnitude at 3|secant|.
+            max_g = 3.0 * ti.abs(secant)
+            if ti.abs(g) > max_g:
+                # Preserve sign of secant (which equals sign of g here).
+                if secant > 0.0:
+                    result = max_g
+                else:
+                    result = -max_g
+            else:
+                result = g
+        return result
+
+    @ti.kernel
+    def advect_cip(self, field: ti.template(),
+                   grad_field: ti.template(),
+                   new_field: ti.template(),
+                   new_grad_field: ti.template()):
+        """
+        One CIP advection step on a scalar field with its gradient tracked.
+
+        For each grid cell x = (i + 0.5, j + 0.5) * dx:
+
+        1. Back-trace x_back = x - u(x) * dt and find the 2x2 donor
+           neighborhood (i0..i1, j0..j1). Local coords (u_loc, v_loc) in
+           [0, 1] give the fractional position inside this cell.
+
+        2. Read the 12 corner samples: field at the four cells (f00, f10,
+           f01, f11), grad_field.x at the same cells (gx00..gx11), and
+           grad_field.y at the same cells (gy00..gy11).
+
+        3. Evaluate the tensor-product cubic Hermite surface at
+           (u_loc, v_loc). With cell spacing 1 (cell-coordinate units),
+           the tangent basis functions multiply gradients converted to
+           cell units, so each gradient is scaled by dx before being
+           plugged into the Hermite basis.
+
+        4. The new field value is the surface value at (u_loc, v_loc); the
+           new gradient is the analytic partials of the same surface,
+           scaled back to physical units (divided by dx).
+
+        Cross-derivative d^2 rho / dx dy is NOT tracked; the bicubic
+        Hermite is therefore a tensor product with the cross term implicitly
+        set to zero at each corner. This is the standard simplification in
+        graphics CIP implementations; the resulting surface is C^1 along
+        cell edges and produces dramatically less diffusion than any value-
+        only scheme. Reference: Yabe, Aoki (1991), "A universal solver for
+        hyperbolic equations by cubic-polynomial interpolation".
+        """
+        # Standard Hermite basis on [0, 1] in cell-coordinate units.
+        # h00(t) = 2t^3 - 3t^2 + 1     (value at left endpoint)
+        # h10(t) = t^3 - 2t^2 + t      (tangent at left endpoint)
+        # h01(t) = -2t^3 + 3t^2        (value at right endpoint)
+        # h11(t) = t^3 - t^2           (tangent at right endpoint)
+        # Derivatives:
+        # h00'(t) = 6t^2 - 6t
+        # h10'(t) = 3t^2 - 4t + 1
+        # h01'(t) = -6t^2 + 6t
+        # h11'(t) = 3t^2 - 2t
+        for i, j in field:
+            # Back-trace location (cell-coordinate units).
+            p = ti.Vector([i + 0.5, j + 0.5]) - self.dt * self.vel[i, j] / self.dx
+            # Convert to sample()-style fractional position (0,0) at corner of cell (0,0)
+            u = p.x - 0.5
+            v = p.y - 0.5
+            i_b = int(ti.floor(u))
+            j_b = int(ti.floor(v))
+            tx = u - i_b
+            ty = v - j_b
+
+            i0 = i_b % self.res
+            i1 = (i_b + 1) % self.res
+            j0 = j_b % self.res
+            j1 = (j_b + 1) % self.res
+            if ti.static(self.bc_wall):
+                i0 = ti.math.clamp(i_b,     0, self.res - 1)
+                i1 = ti.math.clamp(i_b + 1, 0, self.res - 1)
+                j0 = ti.math.clamp(j_b,     0, self.res - 1)
+                j1 = ti.math.clamp(j_b + 1, 0, self.res - 1)
+
+            # Corner samples
+            f00 = field[i0, j0]; f10 = field[i1, j0]; f01 = field[i0, j1]; f11 = field[i1, j1]
+            g00 = grad_field[i0, j0]; g10 = grad_field[i1, j0]
+            g01 = grad_field[i0, j1]; g11 = grad_field[i1, j1]
+            # Gradients in cell-coordinate units (multiply by dx).
+            gx00 = g00.x * self.dx; gx10 = g10.x * self.dx
+            gx01 = g01.x * self.dx; gx11 = g11.x * self.dx
+            gy00 = g00.y * self.dx; gy10 = g10.y * self.dx
+            gy01 = g01.y * self.dx; gy11 = g11.y * self.dx
+
+            # Fritsch-Carlson monotone-cubic limiting. The Hermite cubic
+            # between two adjacent samples is provably monotone iff each
+            # tangent shares sign with the secant slope between the samples
+            # and has magnitude <= 3 |secant|. Limiting the corner gradients
+            # locally (per back-traced cell) before the Hermite eval kills
+            # the new-extremum overshoots that plain CIP otherwise produces
+            # everywhere -- at the cost of degrading toward plain SL near
+            # local extrema (which is the right trade-off).
+            #
+            # Each gradient component is constrained by exactly one edge of
+            # the donor cell: gx values by the two horizontal edges, gy
+            # values by the two vertical edges. Secants are in cell-coord
+            # units (cells are 1 unit apart by construction).
+            S_x_bot   = f10 - f00
+            S_x_top   = f11 - f01
+            S_y_left  = f01 - f00
+            S_y_right = f11 - f10
+            gx00 = self.fc_limit(gx00, S_x_bot)
+            gx10 = self.fc_limit(gx10, S_x_bot)
+            gx01 = self.fc_limit(gx01, S_x_top)
+            gx11 = self.fc_limit(gx11, S_x_top)
+            gy00 = self.fc_limit(gy00, S_y_left)
+            gy01 = self.fc_limit(gy01, S_y_left)
+            gy10 = self.fc_limit(gy10, S_y_right)
+            gy11 = self.fc_limit(gy11, S_y_right)
+
+            # Hermite basis values + derivatives at (tx, ty).
+            Hx0 = 2.0 * tx * tx * tx - 3.0 * tx * tx + 1.0
+            Hx1 = tx * tx * tx - 2.0 * tx * tx + tx           # multiplies gx (left tangent)
+            Hx2 = -2.0 * tx * tx * tx + 3.0 * tx * tx
+            Hx3 = tx * tx * tx - tx * tx                       # multiplies gx (right tangent)
+            dHx0 = 6.0 * tx * tx - 6.0 * tx
+            dHx1 = 3.0 * tx * tx - 4.0 * tx + 1.0
+            dHx2 = -6.0 * tx * tx + 6.0 * tx
+            dHx3 = 3.0 * tx * tx - 2.0 * tx
+
+            Hy0 = 2.0 * ty * ty * ty - 3.0 * ty * ty + 1.0
+            Hy1 = ty * ty * ty - 2.0 * ty * ty + ty
+            Hy2 = -2.0 * ty * ty * ty + 3.0 * ty * ty
+            Hy3 = ty * ty * ty - ty * ty
+            dHy0 = 6.0 * ty * ty - 6.0 * ty
+            dHy1 = 3.0 * ty * ty - 4.0 * ty + 1.0
+            dHy2 = -6.0 * ty * ty + 6.0 * ty
+            dHy3 = 3.0 * ty * ty - 2.0 * ty
+
+            # Helper: along each row j_fixed in {0, 1}, build the 1D cubic
+            # Hermite of f and of gy at the row. Then combine across rows
+            # with another 1D cubic Hermite in y using f-values + gy-values
+            # at the endpoints.
+            #
+            # Row at y=0: F_row0(tx) = f00 * Hx0 + gx00 * Hx1 + f10 * Hx2 + gx10 * Hx3
+            # Row at y=1: F_row1(tx) = f01 * Hx0 + gx01 * Hx1 + f11 * Hx2 + gx11 * Hx3
+            # Y-gradient at row y=0 evaluated at tx: G_row0(tx) =
+            #     gy00 * Hx0 + 0 * Hx1 + gy10 * Hx2 + 0 * Hx3      (cross-term = 0)
+            # Y-gradient at row y=1 evaluated at tx: G_row1(tx) similarly.
+            # Then sample value: F(tx, ty) = F_row0 * Hy0 + G_row0 * Hy1 + F_row1 * Hy2 + G_row1 * Hy3
+            F_row0 = f00 * Hx0 + gx00 * Hx1 + f10 * Hx2 + gx10 * Hx3
+            F_row1 = f01 * Hx0 + gx01 * Hx1 + f11 * Hx2 + gx11 * Hx3
+            G_row0 = gy00 * Hx0 + gy10 * Hx2
+            G_row1 = gy01 * Hx0 + gy11 * Hx2
+
+            new_f = F_row0 * Hy0 + G_row0 * Hy1 + F_row1 * Hy2 + G_row1 * Hy3
+
+            # New x-gradient: derivative of the surface in x at (tx, ty).
+            # In cell units: d/d(tx) of the surface above.
+            # d F_row / d(tx) = f * dHx0 + gx * dHx1 + f * dHx2 + gx * dHx3
+            dFdtx_row0 = f00 * dHx0 + gx00 * dHx1 + f10 * dHx2 + gx10 * dHx3
+            dFdtx_row1 = f01 * dHx0 + gx01 * dHx1 + f11 * dHx2 + gx11 * dHx3
+            # d G_row / d(tx) uses gy values (cross term zero so only h0/h2 basis)
+            dGdtx_row0 = gy00 * dHx0 + gy10 * dHx2
+            dGdtx_row1 = gy01 * dHx0 + gy11 * dHx2
+            new_gx_cell = (dFdtx_row0 * Hy0 + dGdtx_row0 * Hy1
+                           + dFdtx_row1 * Hy2 + dGdtx_row1 * Hy3)
+
+            # New y-gradient: derivative of the surface in y at (tx, ty).
+            # d F(tx, ty) / d(ty) = F_row0 * dHy0 + G_row0 * dHy1 + F_row1 * dHy2 + G_row1 * dHy3
+            new_gy_cell = (F_row0 * dHy0 + G_row0 * dHy1
+                           + F_row1 * dHy2 + G_row1 * dHy3)
+
+            new_field[i, j] = new_f
+            # Convert gradients back from cell-coordinate units to physical units.
+            new_grad_field[i, j] = ti.Vector([new_gx_cell / self.dx,
+                                              new_gy_cell / self.dx])
 
 
     @ti.kernel
@@ -836,12 +1036,11 @@ class FluidSimulation:
             # The corrector cannot be written in-place because it reads field
             # at the donor neighborhood around the back-traced location, so we
             # write into new_rho / new_vel and copy back.
-            cw = self.maccormack_clamp_width
             self.advect_maccormack_predict(self.rho, self.predict_rho)
-            self.advect_maccormack_correct(self.rho, self.predict_rho, self.new_rho, cw)
+            self.advect_maccormack_correct(self.rho, self.predict_rho, self.new_rho)
             self.rho.copy_from(self.new_rho)
             self.advect_maccormack_predict(self.vel, self.predict_vel)
-            self.advect_maccormack_correct(self.vel, self.predict_vel, self.new_vel, cw)
+            self.advect_maccormack_correct(self.vel, self.predict_vel, self.new_vel)
             self.vel.copy_from(self.new_vel)
 
         elif self.advection_scheme == 4:
@@ -858,11 +1057,19 @@ class FluidSimulation:
             # it is advected by the current velocity, not the just-updated
             # one (consistent with the other scheme dispatches).
             self.advect_maccormack_predict(self.rho, self.predict_rho)
-            self.advect_maccormack_correct(
-                self.rho, self.predict_rho, self.new_rho,
-                self.maccormack_clamp_width,
-            )
+            self.advect_maccormack_correct(self.rho, self.predict_rho, self.new_rho)
             self.rho.copy_from(self.new_rho)
+            self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
+            self.vel.copy_from(self.new_vel)
+
+        elif self.advection_scheme == 6:
+            # Hybrid: WENO5 on vel + CIP cubic-Hermite SL on rho. Same
+            # rho-first ordering as scheme 5. CIP also advects grad_rho
+            # alongside rho; we swap both fields back after the step.
+            self.advect_cip(self.rho, self.grad_rho,
+                            self.new_rho, self.new_grad_rho)
+            self.rho.copy_from(self.new_rho)
+            self.grad_rho.copy_from(self.new_grad_rho)
             self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
             self.vel.copy_from(self.new_vel)
 

@@ -36,6 +36,7 @@ def main():
         2: "MacCormack-SL",
         4: "WENO-5",
         5: "Hybrid (WENO vel + MC rho)",
+        6: "Hybrid (WENO vel + CIP rho)",
     }
 
     print("Controls:")
@@ -45,6 +46,7 @@ def main():
     print("  Key 2: WENO-5")
     print("  Key 3: Selle-style MacCormack with extrema clamp")
     print("  Key 4: Hybrid (WENO vel + MacCormack rho)")
+    print("  Key 5: Hybrid (WENO vel + CIP rho)")
     print("  Key R: Reset Patterns")
     print("  Key F: Apply force to bottom half")
     print("  Key B: Toggle dye gravity (persistent)")
@@ -74,6 +76,8 @@ def main():
                     sim.advection_scheme = 2
                 elif gui.event.key == '4':
                     sim.advection_scheme = 5
+                elif gui.event.key == '5':
+                    sim.advection_scheme = 6
                 elif gui.event.key == 'r':
                     sim.time = 0.0
                     if config.init_type == 'patterns':

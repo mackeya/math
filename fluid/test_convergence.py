@@ -63,6 +63,11 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
     u_vel, v_vel = 1.0, 1.0
     set_uniform_velocity(sim, u_vel, v_vel)
 
+    # Scheme 6 (CIP) reads grad_rho. Seed it from the initial rho via
+    # central differences before the time loop.
+    if sim.advection_scheme == 6:
+        sim.init_grad_rho_from_rho()
+
     steps = int(T / dt)
     for _ in range(steps):
         # Only advect, skip projection as we have fixed velocity
@@ -71,14 +76,15 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
             sim.rho.copy_from(sim.new_rho)
         elif sim.advection_scheme == 2:
             sim.advect_maccormack_predict(sim.rho, sim.predict_rho)
-            sim.advect_maccormack_correct(
-                sim.rho, sim.predict_rho, sim.new_rho,
-                sim.maccormack_clamp_width,
-            )
+            sim.advect_maccormack_correct(sim.rho, sim.predict_rho, sim.new_rho)
             sim.rho.copy_from(sim.new_rho)
         elif sim.advection_scheme == 4:
             sim.step_weno(sim.rho, sim.rho_1, sim.rho_2, sim.new_rho, sim.dq_rho)
             sim.rho.copy_from(sim.new_rho)
+        elif sim.advection_scheme == 6:
+            sim.advect_cip(sim.rho, sim.grad_rho, sim.new_rho, sim.new_grad_rho)
+            sim.rho.copy_from(sim.new_rho)
+            sim.grad_rho.copy_from(sim.new_grad_rho)
 
     # Compute error
     rho_num = sim.rho.to_numpy()
@@ -91,7 +97,8 @@ def main():
     schemes = {
         0: "Semi-Lagrangian",
         2: "MacCormack",
-        4: "WENO5"
+        4: "WENO5",
+        6: "CIP",
     }
 
     resolutions = [32, 64, 128, 256]
