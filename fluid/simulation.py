@@ -43,6 +43,9 @@ class SimulationConfig:
     # (exact spectral solve, periodic BC only — automatically falls back to
     # Jacobi for wall/absorbing/open boundaries).
     pressure_solver: str = 'jacobi'
+    # Number of multigrid V-cycles per pressure solve. 2–4 is typically
+    # sufficient for near-exact convergence; more gives diminishing returns.
+    mg_v_cycles: int = 4
     # Vorticity confinement strength (ε in Fedkiw 2001). At 0.0 the feature
     # is disabled. Typical useful range is 0.1–5.0; larger values increasingly
     # over-energise vortex cores and can cause instability.
