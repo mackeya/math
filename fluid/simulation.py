@@ -101,6 +101,23 @@ class FluidSimulation:
         self.p_temp = ti.field(float, shape=(self.res, self.res))
         self.div = ti.field(float, shape=(self.res, self.res))
 
+        # Geometric Multigrid fields for the pressure Poisson solver.
+        # Level 0 = finest (res × res), level L-1 = coarsest (4 × 4).
+        # Kernels using ti.template() compile a separate specialization
+        # per unique field shape, so passing fields of different sizes to
+        # the same kernel is safe and expected in Taichi.
+        # mg_p[l]: pressure approximation / error correction at level l.
+        # mg_f[l]: RHS — divergence at level 0, restricted residual below.
+        self._mg_num_levels = int(np.log2(self.res)) - 1  # e.g. 8 for res=512
+        self.mg_p = [
+            ti.field(float, shape=(self.res >> l, self.res >> l))
+            for l in range(self._mg_num_levels)
+        ]
+        self.mg_f = [
+            ti.field(float, shape=(self.res >> l, self.res >> l))
+            for l in range(self._mg_num_levels)
+        ]
+
         self.advection_scheme = config.advection_scheme
 
         # RK3 intermediate fields
