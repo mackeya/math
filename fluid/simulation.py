@@ -1221,6 +1221,11 @@ class FluidSimulation:
           6. Post-smooth:  2 more RBGS sweeps
 
         At the coarsest level (4×4), 50 RBGS passes give a near-exact solve.
+
+        When bc_wall is True (Neumann BCs), an additional zero-mean enforcement
+        step is inserted after each restriction (on the coarse RHS) and after
+        the coarsest solve (on the coarse correction). Each enforcement call
+        forces one GPU→CPU sync via float(_mg_reduce_scratch[None]).
         """
         p = self.mg_p[level]
         f = self.mg_f[level]
@@ -1287,6 +1292,13 @@ class FluidSimulation:
 
         Supports periodic BCs and Neumann/wall BCs. Does NOT support
         open/Dirichlet BCs — step() falls back to Jacobi in that case.
+
+        Performance note: for bc_wall=True with res=512 and mg_v_cycles=4,
+        each call to _mg_enforce_zero_mean forces a GPU→CPU sync (reading the
+        scalar sum back to Python). There are ~(num_levels-1+1) * mg_v_cycles + 2
+        such syncs per pressure solve (~34 at default settings). This is a
+        known trade-off for correctness with Neumann BCs; for periodic BCs there
+        are no extra syncs.
         """
         if self.bc_wall:
             # Cold start for Neumann to avoid null-space offset accumulation.
