@@ -114,7 +114,7 @@ def main():
                     elif sim.config.pressure_solver == 'multigrid':
                         sim.config.pressure_solver = 'fft'
                         print("Pressure solver: FFT (exact, periodic BC only)")
-                    else:
+                    elif sim.config.pressure_solver == 'fft':
                         sim.config.pressure_solver = 'jacobi'
                         print("Pressure solver: Jacobi (100 iterations)")
                 elif gui.event.key == 'k':
