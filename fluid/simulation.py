@@ -1167,6 +1167,75 @@ class FluidSimulation:
         p = np.fft.irfft2(P_hat, s=(N, N)).astype(np.float32)
         self.p.from_numpy(p)
 
+    def _mg_v_cycle(self, level: int):
+        """
+        Executes one multigrid V-cycle starting at `level`.
+
+        V-cycle outline:
+          1. Pre-smooth:   2 RBGS sweeps on mg_p[level] given mg_f[level]
+          2. Restrict:     compute r = mg_f[level] - L*mg_p[level], restrict
+                           into mg_f[level+1]
+          3. Zero coarse:  mg_p[level+1] = 0 (solving for the error correction)
+          4. Recurse:      _mg_v_cycle(level+1)  — or exact-solve at coarsest
+          5. Prolongate:   mg_p[level] += P * mg_p[level+1]
+          6. Post-smooth:  2 more RBGS sweeps
+
+        At the coarsest level (4×4), 50 RBGS passes give a near-exact solve.
+        """
+        p = self.mg_p[level]
+        f = self.mg_f[level]
+
+        # Pre-smooth: 2 Red-Black GS sweeps
+        for _ in range(2):
+            self._mg_smooth_rb_kernel(p, f, 0)
+            self._mg_smooth_rb_kernel(p, f, 1)
+
+        # At the coarsest level: solve with many iterations and return
+        if level == self._mg_num_levels - 1:
+            for _ in range(50):
+                self._mg_smooth_rb_kernel(p, f, 0)
+                self._mg_smooth_rb_kernel(p, f, 1)
+            return
+
+        # Restrict residual to next coarser level
+        self._mg_restrict_residual_kernel(p, f, self.mg_f[level + 1])
+
+        # Zero the coarse correction (solving L*e = R(r), start from e=0)
+        self.mg_p[level + 1].fill(0.0)
+
+        # Recursive V-cycle on the coarser level
+        self._mg_v_cycle(level + 1)
+
+        # Prolongate coarse correction and add to fine solution
+        self._mg_prolongate_add_kernel(self.mg_p[level + 1], p)
+
+        # Post-smooth: 2 more RBGS sweeps
+        for _ in range(2):
+            self._mg_smooth_rb_kernel(p, f, 0)
+            self._mg_smooth_rb_kernel(p, f, 1)
+
+    def _solve_pressure_multigrid(self):
+        """
+        Solves ∇²p = ∇·u* using geometric multigrid V-cycles.
+
+        Steps:
+          1. Warm-start from self.p (previous timestep's pressure). Temporal
+             coherence means the initial residual is already small, so fewer
+             V-cycles are needed to converge.
+          2. Copy self.div into mg_f[0] as the RHS.
+          3. Run config.mg_v_cycles V-cycles.
+          4. Copy the result back into self.p for pressure_project().
+
+        Supports periodic BCs (bc_wall=False) and Neumann/wall BCs
+        (bc_wall=True). Does NOT support open/Dirichlet BCs — step() falls
+        back to Jacobi in that case via the `use_multigrid` check.
+        """
+        self.mg_p[0].copy_from(self.p)
+        self.mg_f[0].copy_from(self.div)
+        for _ in range(self.config.mg_v_cycles):
+            self._mg_v_cycle(0)
+        self.p.copy_from(self.mg_p[0])
+
     @ti.kernel
     def _compute_vorticity(self):
         """
