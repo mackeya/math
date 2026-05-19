@@ -1235,10 +1235,23 @@ class FluidSimulation:
             for _ in range(50):
                 self._mg_smooth_rb_kernel(p, f, 0)
                 self._mg_smooth_rb_kernel(p, f, 1)
+            # For Neumann BCs the coarsest correction has a free constant mode.
+            # Subtract its mean so the prolongated correction doesn't introduce
+            # a spurious pressure offset at finer levels.
+            if self.bc_wall:
+                self._mg_enforce_zero_mean(p)
             return
 
         # Restrict residual to next coarser level
         self._mg_restrict_residual_kernel(p, f, self.mg_f[level + 1])
+
+        # For Neumann BCs, enforce the zero-mean compatibility condition on the
+        # restricted RHS. The full-weighting restriction with Neumann clamping
+        # over-weights boundary cells, breaking zero-mean even when the fine-level
+        # residual has zero mean. Without this, the coarse Poisson system is
+        # incompatible and the RBGS iterations diverge.
+        if self.bc_wall:
+            self._mg_enforce_zero_mean(self.mg_f[level + 1])
 
         # Zero the coarse correction (solving L*e = R(r), start from e=0)
         self.mg_p[level + 1].fill(0.0)
@@ -1259,22 +1272,45 @@ class FluidSimulation:
         Solves ∇²p = ∇·u* using geometric multigrid V-cycles.
 
         Steps:
-          1. Warm-start from self.p (previous timestep's pressure). Temporal
-             coherence means the initial residual is already small, so fewer
-             V-cycles are needed to converge.
-          2. Copy self.div into mg_f[0] as the RHS.
-          3. Run config.mg_v_cycles V-cycles.
-          4. Copy the result back into self.p for pressure_project().
+          1. For Neumann/wall BCs (bc_wall=True): start from p=0 rather than
+             warm-starting, to avoid inheriting a null-space offset from the
+             previous frame. Also enforce zero-mean on the RHS (compatibility
+             condition for the singular Neumann system).
+          2. For periodic BCs (bc_wall=False): warm-start from self.p as
+             before.
+          3. Run config.mg_v_cycles V-cycles (each V-cycle enforces zero-mean
+             internally after each restriction when bc_wall=True).
+          4. Copy result back to self.p.
+          5. For Neumann BCs: gauge-fix self.p to zero mean (same role as
+             FFT's P_hat[0,0] = 0 — pressure is only defined up to a
+             constant with all-Neumann BCs).
 
-        Supports periodic BCs (bc_wall=False) and Neumann/wall BCs
-        (bc_wall=True). Does NOT support open/Dirichlet BCs — step() falls
-        back to Jacobi in that case via the `use_multigrid` check.
+        Supports periodic BCs and Neumann/wall BCs. Does NOT support
+        open/Dirichlet BCs — step() falls back to Jacobi in that case.
         """
-        self.mg_p[0].copy_from(self.p)
-        self.mg_f[0].copy_from(self.div)
+        if self.bc_wall:
+            # Cold start for Neumann to avoid null-space offset accumulation.
+            self.mg_p[0].fill(0.0)
+            self.mg_f[0].copy_from(self.div)
+            # Enforce zero-mean on the RHS: self.div should already be zero-mean
+            # by the discrete divergence theorem, but floating-point errors can
+            # introduce a small non-zero mean that breaks coarse-level compatibility.
+            self._mg_enforce_zero_mean(self.mg_f[0])
+        else:
+            # Warm start from previous frame's pressure (periodic BCs only).
+            self.mg_p[0].copy_from(self.p)
+            self.mg_f[0].copy_from(self.div)
+
         for _ in range(self.config.mg_v_cycles):
             self._mg_v_cycle(0)
+
         self.p.copy_from(self.mg_p[0])
+
+        # Gauge fix for Neumann BCs: pressure is only unique up to a constant,
+        # so zero the mean to give a canonical solution. Equivalent to FFT's
+        # P_hat[0,0] = 0 (which also enforces zero-mean pressure).
+        if self.bc_wall:
+            self._mg_enforce_zero_mean(self.p)
 
     @ti.kernel
     def _compute_vorticity(self):
