@@ -345,24 +345,6 @@ class FluidSimulation:
         self.dye_force_active = True
 
     @ti.kernel
-    def _precompute_gradient(self, img: ti.template()):
-        for i, j in self.image_grad:
-            im1 = (i - 1) % self.res
-            ip1 = (i + 1) % self.res
-            jm1 = (j - 1) % self.res
-            jp1 = (j + 1) % self.res
-            if ti.static(self.bc_wall):
-                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
-                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
-                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
-                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
-
-            grad_x = (img[ip1, j] - img[im1, j]) * 0.5 / self.dx
-            grad_y = (img[i, jp1] - img[i, jm1]) * 0.5 / self.dx
-
-            self.image_grad[i, j] = ti.Vector([grad_x, grad_y])
-
-    @ti.kernel
     def _precompute_gradient_perp(self, x: ti.template()):
         for i, j in self.image_grad:
             im1 = (i - 1) % self.res
@@ -647,6 +629,15 @@ class FluidSimulation:
 
     @ti.func
     def weno5_reconstruct(self, v1, v2, v3, v4, v5):
+        """WENO5 5th-order reconstruction (Jiang & Shu 1996).
+
+        Computes the weighted combination of three candidate stencil polynomials
+        (p0, p1, p2) using smoothness indicators beta_k. Weights alpha_k are
+        inversely proportional to (eps + beta_k)^2, so smooth stencils receive
+        higher weight. In smooth flow the result approaches the optimal 5th-order
+        upwind reconstruction; near discontinuities weight falls on smoother
+        stencils, limiting oscillation.
+        """
         eps = 1e-6
         p0 = (2.0 * v1 - 7.0 * v2 + 11.0 * v3) / 6.0
         p1 = (-v2 + 5.0 * v3 + 2.0 * v4) / 6.0
@@ -729,6 +720,8 @@ class FluidSimulation:
 
     @ti.kernel
     def advect_weno_rhs(self, field: ti.template(), dq: ti.template()):
+        """Computes WENO5 flux divergence RHS; paired with the SSP-RK3 kernels
+        to advance a field by one full time step via step_weno / _step_rk3."""
         for i, j in field:
             u = self.vel[i, j]
 
@@ -799,15 +792,25 @@ class FluidSimulation:
         for i, j in field:
             new_field[i, j] = (1.0 / 3.0) * field[i, j] + (2.0 / 3.0) * field_2[i, j] + (2.0 / 3.0) * self.dt * dq[i, j]
 
-    def step_weno(self, field, field_1, field_2, new_field, dq):
-        self.advect_weno_rhs(field, dq)
+    def _step_rk3(self, rhs_fn, field, field_1, field_2, new_field, dq):
+        """SSP-RK3 time integration with an arbitrary WENO-variant RHS kernel."""
+        rhs_fn(field, dq)
         self.rk3_step1(field, field_1, dq)
-
-        self.advect_weno_rhs(field_1, dq)
+        rhs_fn(field_1, dq)
         self.rk3_step2(field, field_1, field_2, dq)
-
-        self.advect_weno_rhs(field_2, dq)
+        rhs_fn(field_2, dq)
         self.rk3_step3(field, field_2, new_field, dq)
+
+    def _step_eulerian(self, rhs_fn):
+        """Advect both rho and vel using one WENO-variant RHS function."""
+        self._step_rk3(rhs_fn, self.rho, self.rho_1, self.rho_2, self.new_rho, self.dq_rho)
+        self.rho.copy_from(self.new_rho)
+        self._step_rk3(rhs_fn, self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
+        self.vel.copy_from(self.new_vel)
+
+    def step_weno(self, field, field_1, field_2, new_field, dq):
+        """SSP-RK3 using WENO5 reconstruction."""
+        self._step_rk3(self.advect_weno_rhs, field, field_1, field_2, new_field, dq)
 
     @ti.kernel
     def advect_wenoz_rhs(self, field: ti.template(), dq: ti.template()):
@@ -861,13 +864,8 @@ class FluidSimulation:
             dq[i, j] = -(flux_x + flux_y) / self.dx
 
     def step_wenoz(self, field, field_1, field_2, new_field, dq):
-        """SSP-RK3 time integration using the WENO-Z spatial reconstruction."""
-        self.advect_wenoz_rhs(field, dq)
-        self.rk3_step1(field, field_1, dq)
-        self.advect_wenoz_rhs(field_1, dq)
-        self.rk3_step2(field, field_1, field_2, dq)
-        self.advect_wenoz_rhs(field_2, dq)
-        self.rk3_step3(field, field_2, new_field, dq)
+        """SSP-RK3 using WENO-Z reconstruction."""
+        self._step_rk3(self.advect_wenoz_rhs, field, field_1, field_2, new_field, dq)
 
     @ti.kernel
     def advect_teno5_rhs(self, field: ti.template(), dq: ti.template()):
@@ -921,13 +919,8 @@ class FluidSimulation:
             dq[i, j] = -(flux_x + flux_y) / self.dx
 
     def step_teno5(self, field, field_1, field_2, new_field, dq):
-        """SSP-RK3 time integration using the TENO5 spatial reconstruction."""
-        self.advect_teno5_rhs(field, dq)
-        self.rk3_step1(field, field_1, dq)
-        self.advect_teno5_rhs(field_1, dq)
-        self.rk3_step2(field, field_1, field_2, dq)
-        self.advect_teno5_rhs(field_2, dq)
-        self.rk3_step3(field, field_2, new_field, dq)
+        """SSP-RK3 using TENO5 reconstruction."""
+        self._step_rk3(self.advect_teno5_rhs, field, field_1, field_2, new_field, dq)
 
     @ti.kernel
     def compute_divergence(self):
@@ -1070,46 +1063,27 @@ class FluidSimulation:
         self.time += self.dt
         # Advection
         if self.advection_scheme == 4:
-            # WENO5 + SSP-RK3
-            self.step_weno(self.rho, self.rho_1, self.rho_2, self.new_rho, self.dq_rho)
-            self.rho.copy_from(self.new_rho)
-            self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
-            self.vel.copy_from(self.new_vel)
+            self._step_eulerian(self.advect_weno_rhs)
 
         elif self.advection_scheme == 8:
-            # Hybrid: WENO5 on vel + Bidirectional CMM on rho (bilinear render).
-            # 1) Advect the backward map X (stored as delta = X - x) with WENO5+RK3.
-            # 2) Advance the forward map Y by RK2 (Lagrangian trajectory).
-            # 3) Render rho by bilinearly sampling rho_source at X. One interpolation
-            #    per frame regardless of step count.
-            # 4) Velocity as usual.
+            # WENO5 on vel + Bidirectional CMM on rho (bilinear render).
+            # rho is rendered from the backward map rather than advected directly,
+            # so only the map delta and vel are stepped here.
             # Remap-trigger check happens at the end of step().
-            self.step_weno(self.backward_map, self.delta_1, self.delta_2,
-                            self.new_backward_map, self.dq_delta)
-            # Combine the copy-back with the per-step source term u*dt
-            # that the delta-formulation of the backward-map update
-            # requires (see _finalize_backward_map_step docstring).
+            self._step_rk3(self.advect_weno_rhs, self.backward_map, self.delta_1,
+                           self.delta_2, self.new_backward_map, self.dq_delta)
             self._finalize_backward_map_step()
             self.advect_forward_map_rk2()
             self.render_dye_from_backward_map()
-            self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
+            self._step_rk3(self.advect_weno_rhs, self.vel, self.vel_1, self.vel_2,
+                           self.new_vel, self.dq_vel)
             self.vel.copy_from(self.new_vel)
 
         elif self.advection_scheme == 9:
-            # WENO-Z + SSP-RK3: recovers ideal 5th-order weights in smooth flow,
-            # sharper than WENO5 while retaining the same stability envelope.
-            self.step_wenoz(self.rho, self.rho_1, self.rho_2, self.new_rho, self.dq_rho)
-            self.rho.copy_from(self.new_rho)
-            self.step_wenoz(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
-            self.vel.copy_from(self.new_vel)
+            self._step_eulerian(self.advect_wenoz_rhs)
 
         elif self.advection_scheme == 10:
-            # TENO5 + SSP-RK3: binary stencil selection via a global smoothness
-            # threshold; exact ideal weights in smooth flow, ENO-like near shocks.
-            self.step_teno5(self.rho, self.rho_1, self.rho_2, self.new_rho, self.dq_rho)
-            self.rho.copy_from(self.new_rho)
-            self.step_teno5(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
-            self.vel.copy_from(self.new_vel)
+            self._step_eulerian(self.advect_teno5_rhs)
 
         # Optional per-step Laplacian-based unsharp pass on the dye field.
         # Default-off via SimulationConfig.sharpen_strength = 0.0. When on,
