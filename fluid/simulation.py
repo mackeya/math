@@ -150,6 +150,10 @@ class FluidSimulation:
         # Mirrors the pattern of self._max_vel_norm.
         self._map_distortion = ti.field(float, shape=())
 
+        # Scalar accumulator for multigrid mean-reduction (zero-mean enforcement).
+        # Follows the same pattern as _map_distortion / _max_vel_norm.
+        self._mg_reduce_scratch = ti.field(float, shape=())
+
         # Scalar 0-d field used as the accumulator for the max-CFL reduction
         # in max_cfl(). Lives on the simulation so we don't allocate per call.
         self._max_vel_norm = ti.field(float, shape=())
@@ -1046,6 +1050,25 @@ class FluidSimulation:
                 p[i, j] = (pl + pr + pb + pt - f[i, j] * dx2) * 0.25
 
     @ti.kernel
+    def _mg_compute_sum_kernel(self, field: ti.template()):
+        """
+        Atomically accumulates the sum of all values in `field` into
+        self._mg_reduce_scratch[None]. The caller must read
+        self._mg_reduce_scratch[None] and divide by the cell count.
+
+        Follows the same reduce-into-0d-field pattern as _compute_map_distortion.
+        """
+        self._mg_reduce_scratch[None] = 0.0
+        for i, j in field:
+            ti.atomic_add(self._mg_reduce_scratch[None], field[i, j])
+
+    @ti.kernel
+    def _mg_subtract_constant_kernel(self, field: ti.template(), c: float):
+        """Subtracts a constant c from every cell of field (in-place)."""
+        for i, j in field:
+            field[i, j] -= c
+
+    @ti.kernel
     def _mg_restrict_residual_kernel(self,
                                       fine_p: ti.template(),
                                       fine_f: ti.template(),
@@ -1166,6 +1189,23 @@ class FluidSimulation:
 
         p = np.fft.irfft2(P_hat, s=(N, N)).astype(np.float32)
         self.p.from_numpy(p)
+
+    def _mg_enforce_zero_mean(self, field):
+        """
+        Subtracts the mean of `field` from all its cells, enforcing the
+        zero-mean compatibility condition required by the Neumann Poisson
+        equation at each multigrid level.
+
+        Used after restriction and after the coarsest-level solve to prevent
+        null-space drift when bc_wall is True. Follows the reduction pattern
+        of _compute_map_distortion: accumulate into a 0-d scratch field with
+        atomic_add, read back in Python, then subtract the mean in a second
+        kernel.
+        """
+        nc = field.shape[0]
+        self._mg_compute_sum_kernel(field)
+        mean = float(self._mg_reduce_scratch[None]) / (nc * nc)
+        self._mg_subtract_constant_kernel(field, mean)
 
     def _mg_v_cycle(self, level: int):
         """
