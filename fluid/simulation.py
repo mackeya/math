@@ -1443,10 +1443,19 @@ class FluidSimulation:
         # Projection (Chorin's Projection Method)
         self.compute_divergence()
 
-        # Pressure solve: FFT (exact, periodic only) or Jacobi (iterative).
-        use_fft = (self.config.pressure_solver == 'fft' and not self.bc_wall and not self.bc_open)
+        # Pressure solve: select solver based on config and boundary conditions.
+        # 'fft':        exact spectral solve, periodic BCs only.
+        # 'multigrid':  geometric V-cycle; supports periodic and Neumann/wall
+        #               BCs, but NOT open/Dirichlet (falls through to Jacobi).
+        # 'jacobi':     iterative fallback; used for open BCs regardless of config.
+        use_fft = (self.config.pressure_solver == 'fft'
+                   and not self.bc_wall and not self.bc_open)
+        use_multigrid = (self.config.pressure_solver == 'multigrid'
+                         and not self.bc_open)
         if use_fft:
             self._solve_pressure_fft()
+        elif use_multigrid:
+            self._solve_pressure_multigrid()
         else:
             for _ in range(100):
                 self.pressure_solve_jacobi(self.p, self.p_temp)
