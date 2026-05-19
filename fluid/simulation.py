@@ -43,9 +43,6 @@ class SimulationConfig:
     # (exact spectral solve, periodic BC only — automatically falls back to
     # Jacobi for wall/absorbing/open boundaries).
     pressure_solver: str = 'jacobi'
-    # Number of multigrid V-cycles per pressure solve. 2–4 is typically
-    # sufficient for near-exact convergence; more gives diminishing returns.
-    mg_v_cycles: int = 4
     # Vorticity confinement strength (ε in Fedkiw 2001). At 0.0 the feature
     # is disabled. Typical useful range is 0.1–5.0; larger values increasingly
     # over-energise vortex cores and can cause instability.
@@ -101,23 +98,6 @@ class FluidSimulation:
         self.p_temp = ti.field(float, shape=(self.res, self.res))
         self.div = ti.field(float, shape=(self.res, self.res))
 
-        # Geometric Multigrid fields for the pressure Poisson solver.
-        # Level 0 = finest (res × res), level L-1 = coarsest (4 × 4).
-        # Kernels using ti.template() compile a separate specialization
-        # per unique field shape, so passing fields of different sizes to
-        # the same kernel is safe and expected in Taichi.
-        # mg_p[l]: pressure approximation / error correction at level l.
-        # mg_f[l]: RHS — divergence at level 0, restricted residual below.
-        self._mg_num_levels = int(np.log2(self.res)) - 1  # e.g. 8 for res=512
-        self.mg_p = [
-            ti.field(float, shape=(self.res >> l, self.res >> l))
-            for l in range(self._mg_num_levels)
-        ]
-        self.mg_f = [
-            ti.field(float, shape=(self.res >> l, self.res >> l))
-            for l in range(self._mg_num_levels)
-        ]
-
         self.advection_scheme = config.advection_scheme
 
         # RK3 intermediate fields
@@ -149,10 +129,6 @@ class FluidSimulation:
         # 0-d accumulator for the max-self-consistency-error reduction.
         # Mirrors the pattern of self._max_vel_norm.
         self._map_distortion = ti.field(float, shape=())
-
-        # Scalar accumulator for multigrid mean-reduction (zero-mean enforcement).
-        # Follows the same pattern as _map_distortion / _max_vel_norm.
-        self._mg_reduce_scratch = ti.field(float, shape=())
 
         # Scalar 0-d field used as the accumulator for the max-CFL reduction
         # in max_cfl(). Lives on the simulation so we don't allocate per call.
@@ -1008,150 +984,6 @@ class FluidSimulation:
                 pt = p[i, ti.math.clamp(j + 1, 0, self.res - 1)]
             new_p[i, j] = (pl + pr + pb + pt - self.div[i, j] * self.dx * self.dx) * 0.25
 
-    @ti.kernel
-    def _mg_smooth_rb_kernel(self,
-                              p: ti.template(),
-                              f: ti.template(),
-                              color: int):
-        """
-        One Red-Black Gauss-Seidel smoothing pass over cells of the given
-        color: 0 = even cells where (i+j)%2==0, 1 = odd cells.
-
-        Solves one in-place sweep of L*p = f:
-            p[i,j] <- (pl + pr + pb + pt - f[i,j] * dx_l²) / 4
-        where dx_l = 1.0 / p.shape[0] is the grid spacing at this level.
-
-        RBGS is safe for parallel execution: all writes target cells of
-        `color`, all reads come from the opposite color (5-point stencil
-        neighbors of an even cell are always odd, and vice versa).
-
-        Boundary conditions controlled by ti.static(self.bc_wall):
-          - periodic (False): modular wrap using (x + n) % n
-          - Neumann/wall (True): clamp to [0, n-1], enforcing ∂p/∂n = 0
-        """
-        n = p.shape[0]
-        dx_l = 1.0 / n
-        dx2 = dx_l * dx_l
-        for i, j in p:
-            if (i + j) % 2 == color:
-                im1 = (i - 1 + n) % n
-                ip1 = (i + 1) % n
-                jm1 = (j - 1 + n) % n
-                jp1 = (j + 1) % n
-                if ti.static(self.bc_wall):
-                    im1 = ti.math.clamp(i - 1, 0, n - 1)
-                    ip1 = ti.math.clamp(i + 1, 0, n - 1)
-                    jm1 = ti.math.clamp(j - 1, 0, n - 1)
-                    jp1 = ti.math.clamp(j + 1, 0, n - 1)
-                pl = p[im1, j]
-                pr = p[ip1, j]
-                pb = p[i, jm1]
-                pt = p[i, jp1]
-                p[i, j] = (pl + pr + pb + pt - f[i, j] * dx2) * 0.25
-
-    @ti.kernel
-    def _mg_compute_sum_kernel(self, field: ti.template()):
-        """
-        Atomically accumulates the sum of all values in `field` into
-        self._mg_reduce_scratch[None]. The caller must read
-        self._mg_reduce_scratch[None] and divide by the cell count.
-
-        Follows the same reduce-into-0d-field pattern as _compute_map_distortion.
-        """
-        self._mg_reduce_scratch[None] = 0.0
-        for i, j in field:
-            ti.atomic_add(self._mg_reduce_scratch[None], field[i, j])
-
-    @ti.kernel
-    def _mg_subtract_constant_kernel(self, field: ti.template(), c: float):
-        """Subtracts a constant c from every cell of field (in-place)."""
-        for i, j in field:
-            field[i, j] -= c
-
-    @ti.kernel
-    def _mg_restrict_residual_kernel(self,
-                                      fine_p: ti.template(),
-                                      fine_f: ti.template(),
-                                      coarse_f: ti.template()):
-        """
-        Computes the residual r = f - L*p on the fine grid, then restricts
-        it to the coarse grid using 9-point full-weighting:
-            coarse_f[I,J] = Σ_{di,dj∈{-1,0,1}} w(di,dj)/16 · r[2I+di, 2J+dj]
-        where w(di,dj) = (2-|di|)*(2-|dj|) gives weights 4,2,2,1 for
-        center, face, edge neighbors respectively (sum = 16).
-
-        fine_p and fine_f have shape (n, n); coarse_f has shape (n//2, n//2).
-        The discrete Laplacian uses dx_l = 1.0 / n (fine grid spacing).
-
-        Boundary conditions are handled the same way as _mg_smooth_rb_kernel.
-        """
-        n  = fine_p.shape[0]
-        dx_l = 1.0 / n
-        dx2  = dx_l * dx_l
-        for I, J in coarse_f:
-            r_sum = 0.0
-            for di, dj in ti.static([(-1,-1),(-1,0),(-1,1),(0,-1),(0,0),(0,1),(1,-1),(1,0),(1,1)]):
-                fi = 2 * I + di
-                fj = 2 * J + dj
-                # Wrap fine index: fi may be -1 when I=0, di=-1
-                fi_w = (fi + n) % n
-                fj_w = (fj + n) % n
-                if ti.static(self.bc_wall):
-                    fi_w = ti.math.clamp(fi, 0, n - 1)
-                    fj_w = ti.math.clamp(fj, 0, n - 1)
-                # Neighbors of the fine cell for its Laplacian
-                fi_m = (fi_w - 1 + n) % n
-                fi_p = (fi_w + 1) % n
-                fj_m = (fj_w - 1 + n) % n
-                fj_p = (fj_w + 1) % n
-                if ti.static(self.bc_wall):
-                    fi_m = ti.math.clamp(fi_w - 1, 0, n - 1)
-                    fi_p = ti.math.clamp(fi_w + 1, 0, n - 1)
-                    fj_m = ti.math.clamp(fj_w - 1, 0, n - 1)
-                    fj_p = ti.math.clamp(fj_w + 1, 0, n - 1)
-                lap_p = (fine_p[fi_m, fj_w] + fine_p[fi_p, fj_w]
-                       + fine_p[fi_w, fj_m] + fine_p[fi_w, fj_p]
-                       - 4.0 * fine_p[fi_w, fj_w]) / dx2
-                r_ij = fine_f[fi_w, fj_w] - lap_p
-                w = float((2 - abs(di)) * (2 - abs(dj)))
-                r_sum += w * r_ij
-            coarse_f[I, J] = r_sum / 16.0
-
-    @ti.kernel
-    def _mg_prolongate_add_kernel(self,
-                                   coarse_p: ti.template(),
-                                   fine_p:   ti.template()):
-        """
-        Bilinear prolongation: interpolates coarse_p onto the fine grid
-        and ADDS the result to fine_p (fine_p += P * coarse_p).
-
-        Each fine cell (i, j) maps to coarse cell I = i//2, J = j//2.
-        The fractional offset into the coarse cell is:
-            fx = 0.5 if i is odd (fine cell straddles coarse boundary)
-            fx = 0.0 if i is even (fine cell aligns with coarse center)
-        Note: this bilinear prolongation is not the exact adjoint of the
-        9-point full-weighting restriction; non-adjoint R/P pairs are
-        standard practice and do not compromise multigrid convergence.
-
-        Boundary conditions: periodic wrap or clamp for I+1, J+1.
-        """
-        n_c = coarse_p.shape[0]
-        for i, j in fine_p:
-            I  = i // 2
-            J  = j // 2
-            fx = float(i % 2) * 0.5
-            fy = float(j % 2) * 0.5
-            I1 = (I + 1) % n_c
-            J1 = (J + 1) % n_c
-            if ti.static(self.bc_wall):
-                I1 = ti.math.clamp(I + 1, 0, n_c - 1)
-                J1 = ti.math.clamp(J + 1, 0, n_c - 1)
-            val = ((1.0 - fx) * (1.0 - fy) * coarse_p[I,  J ]
-                 + fx          * (1.0 - fy) * coarse_p[I1, J ]
-                 + (1.0 - fx) * fy          * coarse_p[I,  J1]
-                 + fx          * fy          * coarse_p[I1, J1])
-            fine_p[i, j] += val
-
     def _solve_pressure_fft(self):
         """
         Solves the Pressure Poisson Equation ∇²p = ∇·u* exactly via the
@@ -1189,140 +1021,6 @@ class FluidSimulation:
 
         p = np.fft.irfft2(P_hat, s=(N, N)).astype(np.float32)
         self.p.from_numpy(p)
-
-    def _mg_enforce_zero_mean(self, field):
-        """
-        Subtracts the mean of `field` from all its cells, enforcing the
-        zero-mean compatibility condition required by the Neumann Poisson
-        equation at each multigrid level.
-
-        Used after restriction and after the coarsest-level solve to prevent
-        null-space drift when bc_wall is True. Follows the reduction pattern
-        of _compute_map_distortion: accumulate into a 0-d scratch field with
-        atomic_add, read back in Python, then subtract the mean in a second
-        kernel.
-        """
-        nc = field.shape[0]
-        self._mg_compute_sum_kernel(field)
-        mean = float(self._mg_reduce_scratch[None]) / (nc * nc)
-        self._mg_subtract_constant_kernel(field, mean)
-
-    def _mg_v_cycle(self, level: int):
-        """
-        Executes one multigrid V-cycle starting at `level`.
-
-        V-cycle outline:
-          1. Pre-smooth:   2 RBGS sweeps on mg_p[level] given mg_f[level]
-          2. Restrict:     compute r = mg_f[level] - L*mg_p[level], restrict
-                           into mg_f[level+1]
-          3. Zero coarse:  mg_p[level+1] = 0 (solving for the error correction)
-          4. Recurse:      _mg_v_cycle(level+1)  — or exact-solve at coarsest
-          5. Prolongate:   mg_p[level] += P * mg_p[level+1]
-          6. Post-smooth:  2 more RBGS sweeps
-
-        At the coarsest level (4×4), 50 RBGS passes give a near-exact solve.
-
-        When bc_wall is True (Neumann BCs), an additional zero-mean enforcement
-        step is inserted after each restriction (on the coarse RHS) and after
-        the coarsest solve (on the coarse correction). Each enforcement call
-        forces one GPU→CPU sync via float(_mg_reduce_scratch[None]).
-        """
-        p = self.mg_p[level]
-        f = self.mg_f[level]
-
-        # Pre-smooth: 2 Red-Black GS sweeps
-        for _ in range(2):
-            self._mg_smooth_rb_kernel(p, f, 0)
-            self._mg_smooth_rb_kernel(p, f, 1)
-
-        # At the coarsest level: solve with many iterations and return
-        if level == self._mg_num_levels - 1:
-            for _ in range(50):
-                self._mg_smooth_rb_kernel(p, f, 0)
-                self._mg_smooth_rb_kernel(p, f, 1)
-            # For Neumann BCs the coarsest correction has a free constant mode.
-            # Subtract its mean so the prolongated correction doesn't introduce
-            # a spurious pressure offset at finer levels.
-            if self.bc_wall:
-                self._mg_enforce_zero_mean(p)
-            return
-
-        # Restrict residual to next coarser level
-        self._mg_restrict_residual_kernel(p, f, self.mg_f[level + 1])
-
-        # For Neumann BCs, enforce the zero-mean compatibility condition on the
-        # restricted RHS. The full-weighting restriction with Neumann clamping
-        # over-weights boundary cells, breaking zero-mean even when the fine-level
-        # residual has zero mean. Without this, the coarse Poisson system is
-        # incompatible and the RBGS iterations diverge.
-        if self.bc_wall:
-            self._mg_enforce_zero_mean(self.mg_f[level + 1])
-
-        # Zero the coarse correction (solving L*e = R(r), start from e=0)
-        self.mg_p[level + 1].fill(0.0)
-
-        # Recursive V-cycle on the coarser level
-        self._mg_v_cycle(level + 1)
-
-        # Prolongate coarse correction and add to fine solution
-        self._mg_prolongate_add_kernel(self.mg_p[level + 1], p)
-
-        # Post-smooth: 2 more RBGS sweeps
-        for _ in range(2):
-            self._mg_smooth_rb_kernel(p, f, 0)
-            self._mg_smooth_rb_kernel(p, f, 1)
-
-    def _solve_pressure_multigrid(self):
-        """
-        Solves ∇²p = ∇·u* using geometric multigrid V-cycles.
-
-        Steps:
-          1. For Neumann/wall BCs (bc_wall=True): start from p=0 rather than
-             warm-starting, to avoid inheriting a null-space offset from the
-             previous frame. Also enforce zero-mean on the RHS (compatibility
-             condition for the singular Neumann system).
-          2. For periodic BCs (bc_wall=False): warm-start from self.p as
-             before.
-          3. Run config.mg_v_cycles V-cycles (each V-cycle enforces zero-mean
-             internally after each restriction when bc_wall=True).
-          4. Copy result back to self.p.
-          5. For Neumann BCs: gauge-fix self.p to zero mean (same role as
-             FFT's P_hat[0,0] = 0 — pressure is only defined up to a
-             constant with all-Neumann BCs).
-
-        Supports periodic BCs and Neumann/wall BCs. Does NOT support
-        open/Dirichlet BCs — step() falls back to Jacobi in that case.
-
-        Performance note: for bc_wall=True with res=512 and mg_v_cycles=4,
-        each call to _mg_enforce_zero_mean forces a GPU→CPU sync (reading the
-        scalar sum back to Python). There are ~(num_levels-1+1) * mg_v_cycles + 2
-        such syncs per pressure solve (~34 at default settings). This is a
-        known trade-off for correctness with Neumann BCs; for periodic BCs there
-        are no extra syncs.
-        """
-        if self.bc_wall:
-            # Cold start for Neumann to avoid null-space offset accumulation.
-            self.mg_p[0].fill(0.0)
-            self.mg_f[0].copy_from(self.div)
-            # Enforce zero-mean on the RHS: self.div should already be zero-mean
-            # by the discrete divergence theorem, but floating-point errors can
-            # introduce a small non-zero mean that breaks coarse-level compatibility.
-            self._mg_enforce_zero_mean(self.mg_f[0])
-        else:
-            # Warm start from previous frame's pressure (periodic BCs only).
-            self.mg_p[0].copy_from(self.p)
-            self.mg_f[0].copy_from(self.div)
-
-        for _ in range(self.config.mg_v_cycles):
-            self._mg_v_cycle(0)
-
-        self.p.copy_from(self.mg_p[0])
-
-        # Gauge fix for Neumann BCs: pressure is only unique up to a constant,
-        # so zero the mean to give a canonical solution. Equivalent to FFT's
-        # P_hat[0,0] = 0 (which also enforces zero-mean pressure).
-        if self.bc_wall:
-            self._mg_enforce_zero_mean(self.p)
 
     @ti.kernel
     def _compute_vorticity(self):
@@ -1531,19 +1229,10 @@ class FluidSimulation:
         # Projection (Chorin's Projection Method)
         self.compute_divergence()
 
-        # Pressure solve: select solver based on config and boundary conditions.
-        # 'fft':        exact spectral solve, periodic BCs only.
-        # 'multigrid':  geometric V-cycle; supports periodic and Neumann/wall
-        #               BCs, but NOT open/Dirichlet (falls through to Jacobi).
-        # 'jacobi':     iterative fallback; used for open BCs regardless of config.
-        use_fft = (self.config.pressure_solver == 'fft'
-                   and not self.bc_wall and not self.bc_open)
-        use_multigrid = (self.config.pressure_solver == 'multigrid'
-                         and not self.bc_open)
+        # Pressure solve: FFT (exact, periodic only) or Jacobi (iterative).
+        use_fft = (self.config.pressure_solver == 'fft' and not self.bc_wall and not self.bc_open)
         if use_fft:
             self._solve_pressure_fft()
-        elif use_multigrid:
-            self._solve_pressure_multigrid()
         else:
             for _ in range(100):
                 self.pressure_solve_jacobi(self.p, self.p_temp)

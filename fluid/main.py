@@ -18,9 +18,9 @@ def main():
     #       absorbing zeros out dye reaching the boundary
     # - 'open': dye region surrounded by clean fluid at zero pressure,
     #      velocity unconstrained at boundary
-    config.bc_type = 'open'
-    # config.bc_type = 'absorbing'
-    config.bc_type = 'periodic'
+    # config.bc_type = 'open'
+    config.bc_type = 'absorbing'
+    # config.bc_type = 'periodic'
 
     sim = FluidSimulation(config)
     if config.init_type == 'patterns':
@@ -106,15 +106,11 @@ def main():
                     else:
                         sim.config.radial_coeff = 0.0
                 elif gui.event.key == 'p':
-                    # Cycle pressure solver: jacobi → multigrid → fft → jacobi …
-                    # Multigrid and FFT have fallback behavior for non-periodic BCs.
+                    # Toggle pressure solver between Jacobi (iterative) and FFT (exact, periodic only).
                     if sim.config.pressure_solver == 'jacobi':
-                        sim.config.pressure_solver = 'multigrid'
-                        print(f"Pressure solver: Multigrid ({sim.config.mg_v_cycles} V-cycles)")
-                    elif sim.config.pressure_solver == 'multigrid':
                         sim.config.pressure_solver = 'fft'
                         print("Pressure solver: FFT (exact, periodic BC only)")
-                    elif sim.config.pressure_solver == 'fft':
+                    else:
                         sim.config.pressure_solver = 'jacobi'
                         print("Pressure solver: Jacobi (100 iterations)")
                 elif gui.event.key == 'k':
@@ -183,9 +179,7 @@ def main():
             solver_label = sim.config.pressure_solver.upper()
             if sim.config.pressure_solver == 'fft' and (sim.bc_wall or sim.bc_open):
                 solver_label += " (fallback: Jacobi)"
-            if sim.config.pressure_solver == 'multigrid' and sim.bc_open:
-                solver_label += " (fallback: Jacobi)"
-            gui.text(f"Pressure: {solver_label}  [P to cycle]", pos=(0.05, 0.70), color=0xFFFFFF)
+            gui.text(f"Pressure: {solver_label}  [P to toggle]", pos=(0.05, 0.70), color=0xFFFFFF)
             vc_str = f"{sim.config.vorticity_confinement_strength:.2f}"
             gui.text(f"Vortex confinement: {vc_str}  [K / L]", pos=(0.05, 0.65), color=0xFFFFFF)
 

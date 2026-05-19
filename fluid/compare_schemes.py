@@ -35,10 +35,12 @@ INIT = 'image'                  # 'patterns' or 'image'
 INIT = 'patterns'
 IMAGE_PATH = './lenna.png'
 N_STEPS = 2000                  # simulated time = N_STEPS * DT
-BC_TYPE = 'periodic'           # matches main.py default
+# BC_TYPE = 'periodic'           # matches main.py default
+BC_TYPE = 'absorbing'           # matches main.py default
 PERSISTENT_TORQUE = 0.0         # equivalent of pressing 'v' at startup
 PERSISTENT_BUOYANCY = 3.0       # equivalent of pressing 'b'
 PERSISTENT_RADIAL = 0.0         # equivalent of pressing 'c'
+PRESSURE_SOLVER = 'fft'         # jacobi, fft
 
 OUTPUT_DIR = 'comparisons'
 OUTPUT_PREFIX = f't{N_STEPS * DT:.3f}s'
@@ -121,7 +123,8 @@ def main():
           f'{N_STEPS} steps = {sim_time:.3f}s simulated time')
     print(f'Init: {INIT}, BC: {BC_TYPE}, '
           f'persistent torque={PERSISTENT_TORQUE}, '
-          f'buoyancy={PERSISTENT_BUOYANCY}, radial={PERSISTENT_RADIAL}')
+          f'buoyancy={PERSISTENT_BUOYANCY}, radial={PERSISTENT_RADIAL}, '
+          f'pressure_solver={PRESSURE_SOLVER}')
     print()
 
     frames = []
@@ -133,6 +136,7 @@ def main():
             torque_coeff=PERSISTENT_TORQUE,
             buoyancy_coeff=PERSISTENT_BUOYANCY,
             radial_coeff=PERSISTENT_RADIAL,
+            pressure_solver=PRESSURE_SOLVER,
         ))
         if INIT == 'image':
             sim.init_from_image(IMAGE_PATH)

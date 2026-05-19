@@ -56,7 +56,6 @@ def run_pressure_solver_test(solver_name, res):
     and returns the L2 error against the exact solution.
 
     Jacobi runs 100 iterations (default simulation budget).
-    Multigrid runs config.mg_v_cycles V-cycles (default 4).
     FFT is exact up to floating-point and discretisation error.
 
     Pressure has gauge freedom (zero-mean), so both numeric and exact
@@ -76,8 +75,6 @@ def run_pressure_solver_test(solver_name, res):
             sim.p.copy_from(sim.p_temp)
     elif solver_name == 'fft':
         sim._solve_pressure_fft()
-    elif solver_name == 'multigrid':
-        sim._solve_pressure_multigrid()
 
     p_num = sim.p.to_numpy()
     p_exact = get_exact_pressure_solution(res)
@@ -185,7 +182,7 @@ def main():
     print(f"{'Solver':<12} | {'Res':<5} | {'L2 Error':<10} | {'Rate':<5}")
     print("-" * 45)
 
-    pressure_solvers = ['jacobi', 'multigrid', 'fft']
+    pressure_solvers = ['jacobi', 'fft']
     pressure_resolutions = [32, 64, 128, 256]
 
     for solver_name in pressure_solvers:
