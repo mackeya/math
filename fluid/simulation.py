@@ -29,7 +29,7 @@ class SimulationConfig:
     # instance). 4 = WENO5 + SSP-RK3, 8 = WENO5 on vel + Bidirectional
     # Characteristic Mapping on rho (bilinear render), 9 = WENO-Z + SSP-RK3,
     # 10 = TENO5 + SSP-RK3.
-    advection_scheme: int = 4
+    advection_scheme: int = 10
     # Remap trigger threshold for the Characteristic Mapping Method
     # (advection_scheme == 8). When the maximum self-consistency error
     # max |X(Y(x)) - x| of the bidirectional maps exceeds this many cell
@@ -39,6 +39,14 @@ class SimulationConfig:
     # frequent (preserves smooth image quality longer, but eventually the
     # map gets noticeably warped before snapping back). Units: cells (dx).
     cmm_remap_threshold_cells: float = 1.0
+    # Pressure solver: 'jacobi' (iterative, works with all BCs) or 'fft'
+    # (exact spectral solve, periodic BC only — automatically falls back to
+    # Jacobi for wall/absorbing/open boundaries).
+    pressure_solver: str = 'jacobi'
+    # Vorticity confinement strength (ε in Fedkiw 2001). At 0.0 the feature
+    # is disabled. Typical useful range is 0.1–5.0; larger values increasingly
+    # over-energise vortex cores and can cause instability.
+    vorticity_confinement_strength: float = 0.0
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
 
@@ -125,6 +133,9 @@ class FluidSimulation:
         # Scalar 0-d field used as the accumulator for the max-CFL reduction
         # in max_cfl(). Lives on the simulation so we don't allocate per call.
         self._max_vel_norm = ti.field(float, shape=())
+
+        # Scalar vorticity ω = ∂v/∂x - ∂u/∂y, used by vorticity confinement.
+        self.vorticity = ti.field(float, shape=(self.res, self.res))
 
         # Gradual force application
         self.image_grad = ti.Vector.field(2, float, shape=(self.res, self.res))
@@ -973,6 +984,96 @@ class FluidSimulation:
                 pt = p[i, ti.math.clamp(j + 1, 0, self.res - 1)]
             new_p[i, j] = (pl + pr + pb + pt - self.div[i, j] * self.dx * self.dx) * 0.25
 
+    def _solve_pressure_fft(self):
+        """
+        Solves the Pressure Poisson Equation ∇²p = ∇·u* exactly via the
+        Discrete Fourier Transform (periodic BCs only).
+
+        For an N×N periodic grid with cell size dx, the discrete Laplacian
+        has known eigenvalues:
+            λ_{k,l} = (2cos(2πk/N) - 2 + 2cos(2πl/N) - 2) / dx²
+
+        The solution is:
+            P̂_{k,l} = F̂_{k,l} / λ_{k,l}    for (k,l) ≠ (0,0)
+            P̂_{0,0} = 0                       (zero-mean pressure gauge fix)
+            p = IFFT(P̂)
+
+        This gives the exact solution in O(N² log N) rather than the O(N²·iter)
+        approximation of Jacobi iteration.
+        """
+        N = self.res
+        dx = self.dx
+
+        f = self.div.to_numpy()
+
+        F_hat = np.fft.rfft2(f)  # shape (N, N//2+1), complex
+
+        kx = np.arange(N, dtype=np.float64)
+        ky = np.arange(N // 2 + 1, dtype=np.float64)
+        lam_x = (2.0 * np.cos(2.0 * np.pi * kx / N) - 2.0) / (dx * dx)
+        lam_y = (2.0 * np.cos(2.0 * np.pi * ky / N) - 2.0) / (dx * dx)
+        lam = lam_x[:, None] + lam_y[None, :]  # (N, N//2+1)
+
+        # Avoid division by zero at the DC mode; zero it out after solving.
+        lam[0, 0] = 1.0
+        P_hat = F_hat / lam
+        P_hat[0, 0] = 0.0  # zero mean pressure
+
+        p = np.fft.irfft2(P_hat, s=(N, N)).astype(np.float32)
+        self.p.from_numpy(p)
+
+    @ti.kernel
+    def _compute_vorticity(self):
+        """
+        Computes the scalar vorticity ω = ∂v/∂x - ∂u/∂y at every cell centre
+        using second-order central differences.  Result is stored in self.vorticity.
+        """
+        for i, j in self.vorticity:
+            vr = self.vel[(i + 1) % self.res, j].y
+            vl = self.vel[(i - 1) % self.res, j].y
+            ut = self.vel[i, (j + 1) % self.res].x
+            ub = self.vel[i, (j - 1) % self.res].x
+            if ti.static(self.bc_wall):
+                vr = self.vel[ti.math.clamp(i + 1, 0, self.res - 1), j].y
+                vl = self.vel[ti.math.clamp(i - 1, 0, self.res - 1), j].y
+                ut = self.vel[i, ti.math.clamp(j + 1, 0, self.res - 1)].x
+                ub = self.vel[i, ti.math.clamp(j - 1, 0, self.res - 1)].x
+            self.vorticity[i, j] = (vr - vl - ut + ub) * 0.5 / self.dx
+
+    @ti.kernel
+    def _apply_vorticity_confinement(self, strength: float):
+        """
+        Applies vorticity confinement (Fedkiw et al. 2001) to counteract
+        the numerical diffusion of rotational structures.
+
+        The confinement force points tangentially around each vortex core:
+            η  = ∇|ω| / (|∇|ω|| + ε)     (unit normal toward vortex core)
+            F  = strength · |ω| · (−η_y, η_x)
+            vel += F · dt
+
+        Must be called after _compute_vorticity().  Strength (ε_conf) is
+        typically in the range 0.1–5.0.
+        """
+        for i, j in self.vel:
+            om_r = ti.abs(self.vorticity[(i + 1) % self.res, j])
+            om_l = ti.abs(self.vorticity[(i - 1) % self.res, j])
+            om_t = ti.abs(self.vorticity[i, (j + 1) % self.res])
+            om_b = ti.abs(self.vorticity[i, (j - 1) % self.res])
+            if ti.static(self.bc_wall):
+                om_r = ti.abs(self.vorticity[ti.math.clamp(i + 1, 0, self.res - 1), j])
+                om_l = ti.abs(self.vorticity[ti.math.clamp(i - 1, 0, self.res - 1), j])
+                om_t = ti.abs(self.vorticity[i, ti.math.clamp(j + 1, 0, self.res - 1)])
+                om_b = ti.abs(self.vorticity[i, ti.math.clamp(j - 1, 0, self.res - 1)])
+
+            eta = ti.Vector([(om_r - om_l) * 0.5 / self.dx,
+                             (om_t - om_b) * 0.5 / self.dx])
+            eta_norm = eta.norm() + 1e-6
+            eta = eta / eta_norm
+
+            om = self.vorticity[i, j]
+            force = strength * ti.abs(om) * ti.Vector([-eta.y, eta.x])
+            self.vel[i, j] += force * self.dt
+
     @ti.kernel
     def pressure_project(self):
         """
@@ -1118,15 +1219,26 @@ class FluidSimulation:
         if self.bc_wall and not self.bc_open:
             self.apply_velocity_bc()
 
+        # Vorticity confinement: counteracts numerical diffusion of rotational
+        # structures.  Applied after forces, before pressure solve, so the
+        # confinement force is included in the divergence correction.
+        if self.config.vorticity_confinement_strength != 0.0:
+            self._compute_vorticity()
+            self._apply_vorticity_confinement(self.config.vorticity_confinement_strength)
+
         # Projection (Chorin's Projection Method)
         self.compute_divergence()
 
-        # Jacobi iterative solver for Pressure
-        for _ in range(100): # Increased iterations for better convergence
-            self.pressure_solve_jacobi(self.p, self.p_temp)
-            if self.bc_open:
-                self.apply_open_pressure_bc()
-            self.p.copy_from(self.p_temp)
+        # Pressure solve: FFT (exact, periodic only) or Jacobi (iterative).
+        use_fft = (self.config.pressure_solver == 'fft' and not self.bc_wall and not self.bc_open)
+        if use_fft:
+            self._solve_pressure_fft()
+        else:
+            for _ in range(100):
+                self.pressure_solve_jacobi(self.p, self.p_temp)
+                if self.bc_open:
+                    self.apply_open_pressure_bc()
+                self.p.copy_from(self.p_temp)
 
         self.pressure_project()
 

@@ -18,9 +18,11 @@ def main():
     #       absorbing zeros out dye reaching the boundary
     # - 'open': dye region surrounded by clean fluid at zero pressure,
     #      velocity unconstrained at boundary
-    # config.bc_type = 'open'
-    config.bc_type = 'absorbing'
-    # config.bc_type = 'periodic'
+    config.bc_type = 'open'
+    # config.bc_type = 'absorbing'
+    config.bc_type = 'periodic'
+
+    config.vorticity_confinement_strength = 0.0
 
     sim = FluidSimulation(config)
     if config.init_type == 'patterns':
@@ -46,12 +48,15 @@ def main():
     print("  Key 3: TENO5")
     print("  Key 4: WENO-5 + Bidirectional CMM (bilinear)")
     print("  Key R: Reset Patterns")
-    print("  Key F: Apply force to bottom half")
+    print("  Key F: Apply force to bottom half (held)")
     print("  Key B: Toggle dye gravity (persistent)")
     print("  Key G: Apply image gradient force (gradual)")
     print("  Key D: Apply dye gradient force (gradual/dynamic)")
     print("  Key V: Toggle dye vortex (persistent)")
     print("  Key C: Toggle dye radial (persistent)")
+    print("  Key P: Toggle pressure solver (Jacobi ↔ FFT, periodic BC only)")
+    print("  Key K: Decrease vorticity confinement strength")
+    print("  Key L: Increase vorticity confinement strength")
     print("  Key M: Toggle video recording (writes to ./recordings/)")
 
     prev_mouse = None
@@ -81,9 +86,9 @@ def main():
                     elif config.init_type == 'image':
                         sim.init_from_image("./lenna.png")
                 elif gui.event.key == 'g':
-                    sim.apply_image_gradient_torque("./lenna.png", scale=1.0, duration=0.1, blur_sigma=1.0)
+                    sim.apply_image_gradient_torque("./lenna.png", scale=1.0, duration=0.05, blur_sigma=1.0)
                 elif gui.event.key == 'd':
-                    sim.apply_dye_gradient_torque(scale=0.1, duration=0.1)
+                    sim.apply_dye_gradient_torque(scale=0.1, duration=0.03)
                 elif gui.event.key == 'b':
                     # Toggle buoyancy: set coefficient to default or zero it off
                     if sim.config.buoyancy_coeff < 1.0:
@@ -102,6 +107,24 @@ def main():
                         sim.config.radial_coeff = DEFAULT_FORCE
                     else:
                         sim.config.radial_coeff = 0.0
+                elif gui.event.key == 'p':
+                    # Toggle pressure solver between Jacobi and FFT.
+                    # FFT is exact for periodic BCs and silently ignored otherwise.
+                    if sim.config.pressure_solver == 'jacobi':
+                        sim.config.pressure_solver = 'fft'
+                        print("Pressure solver: FFT (exact, periodic BC)")
+                    else:
+                        sim.config.pressure_solver = 'jacobi'
+                        print("Pressure solver: Jacobi (100 iterations)")
+                elif gui.event.key == 'k':
+                    # Decrease vorticity confinement strength (min 0).
+                    sim.config.vorticity_confinement_strength = max(
+                        0.0, sim.config.vorticity_confinement_strength - 0.01)
+                    print(f"Vorticity confinement: {sim.config.vorticity_confinement_strength:.3f}")
+                elif gui.event.key == 'l':
+                    # Increase vorticity confinement strength.
+                    sim.config.vorticity_confinement_strength += 0.01
+                    print(f"Vorticity confinement: {sim.config.vorticity_confinement_strength:.3f}")
                 elif gui.event.key == 'm':
                     # Toggle video recording. Each press starts a new clip
                     # (with a fresh timestamped filename) or stops the
@@ -154,6 +177,13 @@ def main():
             cfl = sim.max_cfl()
             cfl_color = 0xFF3333 if cfl > 1.0 else 0xFFFFFF
             gui.text(f"max CFL: {cfl:.2f}", pos=(0.05, 0.75), color=cfl_color)
+            # Pressure solver and vorticity confinement state.
+            solver_label = sim.config.pressure_solver.upper()
+            if sim.config.pressure_solver == 'fft' and (sim.bc_wall or sim.bc_open):
+                solver_label += " (fallback: Jacobi)"
+            gui.text(f"Pressure: {solver_label}  [P to toggle]", pos=(0.05, 0.70), color=0xFFFFFF)
+            vc_str = f"{sim.config.vorticity_confinement_strength:.2f}"
+            gui.text(f"Vortex confinement: {vc_str}  [K / L]", pos=(0.05, 0.65), color=0xFFFFFF)
 
             # Recording indicator. Drawn after set_image so it appears in the
             # GUI window only; never enters the recorded video.
