@@ -1106,7 +1106,9 @@ class FluidSimulation:
         The fractional offset into the coarse cell is:
             fx = 0.5 if i is odd (fine cell straddles coarse boundary)
             fx = 0.0 if i is even (fine cell aligns with coarse center)
-        This is the transpose of the 9-point full-weighting restriction.
+        Note: this bilinear prolongation is not the exact adjoint of the
+        9-point full-weighting restriction; non-adjoint R/P pairs are
+        standard practice and do not compromise multigrid convergence.
 
         Boundary conditions: periodic wrap or clamp for I+1, J+1.
         """
