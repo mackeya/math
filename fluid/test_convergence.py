@@ -29,6 +29,62 @@ def get_exact_solution(res, t, u, v, ic_type='smooth'):
         return np.maximum(0, 1 - 5 * r)
     return np.zeros((res, res))
 
+
+def get_exact_pressure_solution(res):
+    """
+    Returns the manufactured pressure solution p(x,y) = sin(2πx)*sin(2πy)
+    on a (res × res) periodic unit grid. Used to test pressure solver accuracy.
+    """
+    x = np.linspace(0, 1, res, endpoint=False)
+    y = np.linspace(0, 1, res, endpoint=False)
+    X, Y = np.meshgrid(x, y, indexing='ij')
+    return np.sin(2 * np.pi * X) * np.sin(2 * np.pi * Y)
+
+
+def get_pressure_poisson_rhs(res):
+    """
+    Returns ∇²p_exact = -8π² · sin(2πx)*sin(2πy), which is the divergence
+    field (RHS) that corresponds to the exact solution get_exact_pressure_solution.
+    """
+    return -8.0 * np.pi**2 * get_exact_pressure_solution(res)
+
+
+def run_pressure_solver_test(solver_name, res):
+    """
+    Tests a pressure solver on the manufactured Poisson problem at a given
+    resolution. Initialises sim.div with the known RHS, runs the solver,
+    and returns the L2 error against the exact solution.
+
+    Jacobi runs 100 iterations (default simulation budget).
+    Multigrid runs config.mg_v_cycles V-cycles (default 4).
+    FFT is exact up to floating-point and discretisation error.
+
+    Pressure has gauge freedom (zero-mean), so both numeric and exact
+    solutions are zero-mean-shifted before comparison.
+    """
+    from simulation import FluidSimulation, SimulationConfig
+    config = SimulationConfig(res=res, pressure_solver=solver_name)
+    sim = FluidSimulation(config)
+
+    rhs = get_pressure_poisson_rhs(res).astype(np.float32)
+    sim.div.from_numpy(rhs)
+    sim.p.fill(0.0)
+
+    if solver_name == 'jacobi':
+        for _ in range(100):
+            sim.pressure_solve_jacobi(sim.p, sim.p_temp)
+            sim.p.copy_from(sim.p_temp)
+    elif solver_name == 'fft':
+        sim._solve_pressure_fft()
+    elif solver_name == 'multigrid':
+        sim._solve_pressure_multigrid()
+
+    p_num = sim.p.to_numpy()
+    p_exact = get_exact_pressure_solution(res)
+    p_num -= p_num.mean()          # remove gauge ambiguity
+    p_exact -= p_exact.mean()
+    return float(np.sqrt(np.mean((p_num - p_exact) ** 2)))
+
 @ti.kernel
 def set_uniform_velocity(sim: ti.template(), u: float, v: float):
     for i, j in sim.vel:
@@ -123,6 +179,25 @@ def main():
 
                 print(f"{name:<20} | {res:<5} | {err:<10.3e} | {rate}")
             print("-" * 50)
+
+    # --- Pressure Solver Convergence (Manufactured Solution) ---
+    print("\n\nPressure Solver Convergence: ∇²p = f, p_exact = sin(2πx)*sin(2πy)")
+    print(f"{'Solver':<12} | {'Res':<5} | {'L2 Error':<10} | {'Rate':<5}")
+    print("-" * 45)
+
+    pressure_solvers = ['jacobi', 'multigrid', 'fft']
+    pressure_resolutions = [32, 64, 128, 256]
+
+    for solver_name in pressure_solvers:
+        errors = []
+        for i, res in enumerate(pressure_resolutions):
+            err = run_pressure_solver_test(solver_name, res)
+            errors.append(err)
+            rate = ""
+            if i > 0 and errors[i - 1] > 0 and err > 0:
+                rate = f"{np.log2(errors[i - 1] / err):.2f}"
+            print(f"{solver_name:<12} | {res:<5} | {err:<10.3e} | {rate}")
+        print("-" * 45)
 
 if __name__ == "__main__":
     main()
