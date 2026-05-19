@@ -1004,6 +1004,129 @@ class FluidSimulation:
                 pt = p[i, ti.math.clamp(j + 1, 0, self.res - 1)]
             new_p[i, j] = (pl + pr + pb + pt - self.div[i, j] * self.dx * self.dx) * 0.25
 
+    @ti.kernel
+    def _mg_smooth_rb_kernel(self,
+                              p: ti.template(),
+                              f: ti.template(),
+                              color: int):
+        """
+        One Red-Black Gauss-Seidel smoothing pass over cells of the given
+        color: 0 = even cells where (i+j)%2==0, 1 = odd cells.
+
+        Solves one in-place sweep of L*p = f:
+            p[i,j] <- (pl + pr + pb + pt - f[i,j] * dx_l²) / 4
+        where dx_l = 1.0 / p.shape[0] is the grid spacing at this level.
+
+        RBGS is safe for parallel execution: all writes target cells of
+        `color`, all reads come from the opposite color (5-point stencil
+        neighbors of an even cell are always odd, and vice versa).
+
+        Boundary conditions controlled by ti.static(self.bc_wall):
+          - periodic (False): modular wrap using (x + n) % n
+          - Neumann/wall (True): clamp to [0, n-1], enforcing ∂p/∂n = 0
+        """
+        n = p.shape[0]
+        dx_l = 1.0 / n
+        dx2 = dx_l * dx_l
+        for i, j in p:
+            if (i + j) % 2 == color:
+                im1 = (i - 1 + n) % n
+                ip1 = (i + 1) % n
+                jm1 = (j - 1 + n) % n
+                jp1 = (j + 1) % n
+                if ti.static(self.bc_wall):
+                    im1 = ti.math.clamp(i - 1, 0, n - 1)
+                    ip1 = ti.math.clamp(i + 1, 0, n - 1)
+                    jm1 = ti.math.clamp(j - 1, 0, n - 1)
+                    jp1 = ti.math.clamp(j + 1, 0, n - 1)
+                pl = p[im1, j]
+                pr = p[ip1, j]
+                pb = p[i, jm1]
+                pt = p[i, jp1]
+                p[i, j] = (pl + pr + pb + pt - f[i, j] * dx2) * 0.25
+
+    @ti.kernel
+    def _mg_restrict_residual_kernel(self,
+                                      fine_p: ti.template(),
+                                      fine_f: ti.template(),
+                                      coarse_f: ti.template()):
+        """
+        Computes the residual r = f - L*p on the fine grid, then restricts
+        it to the coarse grid using 9-point full-weighting:
+            coarse_f[I,J] = Σ_{di,dj∈{-1,0,1}} w(di,dj)/16 · r[2I+di, 2J+dj]
+        where w(di,dj) = (2-|di|)*(2-|dj|) gives weights 4,2,2,1 for
+        center, face, edge neighbors respectively (sum = 16).
+
+        fine_p and fine_f have shape (n, n); coarse_f has shape (n//2, n//2).
+        The discrete Laplacian uses dx_l = 1.0 / n (fine grid spacing).
+
+        Boundary conditions are handled the same way as _mg_smooth_rb_kernel.
+        """
+        n  = fine_p.shape[0]
+        dx_l = 1.0 / n
+        dx2  = dx_l * dx_l
+        for I, J in coarse_f:
+            r_sum = 0.0
+            for di, dj in ti.static([(-1,-1),(-1,0),(-1,1),(0,-1),(0,0),(0,1),(1,-1),(1,0),(1,1)]):
+                fi = 2 * I + di
+                fj = 2 * J + dj
+                # Wrap fine index: fi may be -1 when I=0, di=-1
+                fi_w = (fi + n) % n
+                fj_w = (fj + n) % n
+                if ti.static(self.bc_wall):
+                    fi_w = ti.math.clamp(fi, 0, n - 1)
+                    fj_w = ti.math.clamp(fj, 0, n - 1)
+                # Neighbors of the fine cell for its Laplacian
+                fi_m = (fi_w - 1 + n) % n
+                fi_p = (fi_w + 1) % n
+                fj_m = (fj_w - 1 + n) % n
+                fj_p = (fj_w + 1) % n
+                if ti.static(self.bc_wall):
+                    fi_m = ti.math.clamp(fi_w - 1, 0, n - 1)
+                    fi_p = ti.math.clamp(fi_w + 1, 0, n - 1)
+                    fj_m = ti.math.clamp(fj_w - 1, 0, n - 1)
+                    fj_p = ti.math.clamp(fj_w + 1, 0, n - 1)
+                lap_p = (fine_p[fi_m, fj_w] + fine_p[fi_p, fj_w]
+                       + fine_p[fi_w, fj_m] + fine_p[fi_w, fj_p]
+                       - 4.0 * fine_p[fi_w, fj_w]) / dx2
+                r_ij = fine_f[fi_w, fj_w] - lap_p
+                w = float((2 - abs(di)) * (2 - abs(dj)))
+                r_sum += w * r_ij
+            coarse_f[I, J] = r_sum / 16.0
+
+    @ti.kernel
+    def _mg_prolongate_add_kernel(self,
+                                   coarse_p: ti.template(),
+                                   fine_p:   ti.template()):
+        """
+        Bilinear prolongation: interpolates coarse_p onto the fine grid
+        and ADDS the result to fine_p (fine_p += P * coarse_p).
+
+        Each fine cell (i, j) maps to coarse cell I = i//2, J = j//2.
+        The fractional offset into the coarse cell is:
+            fx = 0.5 if i is odd (fine cell straddles coarse boundary)
+            fx = 0.0 if i is even (fine cell aligns with coarse center)
+        This is the transpose of the 9-point full-weighting restriction.
+
+        Boundary conditions: periodic wrap or clamp for I+1, J+1.
+        """
+        n_c = coarse_p.shape[0]
+        for i, j in fine_p:
+            I  = i // 2
+            J  = j // 2
+            fx = float(i % 2) * 0.5
+            fy = float(j % 2) * 0.5
+            I1 = (I + 1) % n_c
+            J1 = (J + 1) % n_c
+            if ti.static(self.bc_wall):
+                I1 = ti.math.clamp(I + 1, 0, n_c - 1)
+                J1 = ti.math.clamp(J + 1, 0, n_c - 1)
+            val = ((1.0 - fx) * (1.0 - fy) * coarse_p[I,  J ]
+                 + fx          * (1.0 - fy) * coarse_p[I1, J ]
+                 + (1.0 - fx) * fy          * coarse_p[I,  J1]
+                 + fx          * fy          * coarse_p[I1, J1])
+            fine_p[i, j] += val
+
     def _solve_pressure_fft(self):
         """
         Solves the Pressure Poisson Equation ∇²p = ∇·u* exactly via the
