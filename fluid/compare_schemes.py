@@ -32,11 +32,12 @@ from simulation import FluidSimulation, SimulationConfig
 RES = 512                       # simulation grid resolution
 DT = 3e-4                       # time step
 INIT = 'image'                  # 'patterns' or 'image'
+INIT = 'patterns'
 IMAGE_PATH = './lenna.png'
 N_STEPS = 2000                  # simulated time = N_STEPS * DT
-BC_TYPE = 'absorbing'           # matches main.py default
-PERSISTENT_TORQUE = 3.0         # equivalent of pressing 'v' at startup
-PERSISTENT_BUOYANCY = 0.0       # equivalent of pressing 'b'
+BC_TYPE = 'periodic'           # matches main.py default
+PERSISTENT_TORQUE = 0.0         # equivalent of pressing 'v' at startup
+PERSISTENT_BUOYANCY = 3.0       # equivalent of pressing 'b'
 PERSISTENT_RADIAL = 0.0         # equivalent of pressing 'c'
 
 OUTPUT_DIR = 'comparisons'
@@ -47,21 +48,11 @@ OUTPUT_PREFIX = f't{N_STEPS * DT:.3f}s'
 # any scheme-specific toggles. The label is used in the PNG filename and
 # in the contact-sheet tile header.
 
-def _cmm(sim, render, weno):
-    """Helper: select CMM scheme and its two toggles."""
-    sim.advection_scheme = 8
-    sim.cmm_render_mode = render
-    sim.cmm_use_weno_map_advection = weno
-
-
 CONFIGURATIONS = [
-    ("WENO5",                  lambda s: setattr(s, 'advection_scheme', 4)),
-    ("MacCormack-FC",          lambda s: setattr(s, 'advection_scheme', 2)),
-    ("Hybrid MC",              lambda s: setattr(s, 'advection_scheme', 5)),
-    ("CMM bilinear+WENO",      lambda s: _cmm(s, render=0, weno=True)),
-    ("CMM catmull-rom+WENO",   lambda s: _cmm(s, render=1, weno=True)),
-    ("CMM mono-cubic+WENO",    lambda s: _cmm(s, render=2, weno=True)),
-    ("CMM mono-cubic+MC",      lambda s: _cmm(s, render=2, weno=False)),
+    ("WENO5",     lambda s: setattr(s, 'advection_scheme', 4)),
+    ("WENO-Z",    lambda s: setattr(s, 'advection_scheme', 9)),
+    ("TENO5",     lambda s: setattr(s, 'advection_scheme', 10)),
+    ("CMM",       lambda s: setattr(s, 'advection_scheme', 8)),
 ]
 
 

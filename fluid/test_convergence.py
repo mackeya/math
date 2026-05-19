@@ -63,13 +63,6 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
     u_vel, v_vel = 1.0, 1.0
     set_uniform_velocity(sim, u_vel, v_vel)
 
-    # Scheme 6 (CIP) reads grad_rho. Seed it from the initial rho via
-    # central differences before the time loop.
-    if sim.advection_scheme == 6:
-        sim.init_grad_rho_from_rho()
-    # Scheme 7 (particles) needs the particle state seeded from rho.
-    if sim.advection_scheme == 7:
-        sim._init_particles_from_rho()
     # Scheme 8 (Bidirectional CMM) needs rho_source seeded and maps reset.
     if sim.advection_scheme == 8:
         sim._init_cmm_state_from_rho()
@@ -77,36 +70,20 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
     steps = int(T / dt)
     for _ in range(steps):
         # Only advect, skip projection as we have fixed velocity
-        if sim.advection_scheme == 0:
-            sim.advect_semi_lagrangian(sim.rho, sim.new_rho)
-            sim.rho.copy_from(sim.new_rho)
-        elif sim.advection_scheme == 2:
-            sim.advect_maccormack_predict(sim.rho, sim.predict_rho)
-            sim.advect_maccormack_correct(sim.rho, sim.predict_rho, sim.new_rho)
-            sim.rho.copy_from(sim.new_rho)
-        elif sim.advection_scheme == 4:
+        if sim.advection_scheme == 4:
             sim.step_weno(sim.rho, sim.rho_1, sim.rho_2, sim.new_rho, sim.dq_rho)
             sim.rho.copy_from(sim.new_rho)
-        elif sim.advection_scheme == 6:
-            sim.advect_cip(sim.rho, sim.grad_rho, sim.new_rho, sim.new_grad_rho)
-            sim.rho.copy_from(sim.new_rho)
-            sim.grad_rho.copy_from(sim.new_grad_rho)
-        elif sim.advection_scheme == 7:
-            sim.advect_particles_rk2()
-            sim.rho.fill(0.0)
-            sim.splat_particles_to_rho()
         elif sim.advection_scheme == 8:
-            # Mirror the step() dispatch so the test exercises whichever
-            # toggle state is configured (MacCormack vs WENO5 on delta).
-            if sim.cmm_use_weno_map_advection:
-                sim.step_weno(sim.backward_map, sim.delta_1, sim.delta_2,
-                              sim.new_backward_map, sim.dq_delta)
-            else:
-                sim.advect_maccormack_predict(sim.backward_map, sim.predict_backward_map)
-                sim.advect_maccormack_correct(sim.backward_map, sim.predict_backward_map,
-                                              sim.new_backward_map)
+            sim.step_weno(sim.backward_map, sim.delta_1, sim.delta_2,
+                          sim.new_backward_map, sim.dq_delta)
             sim._finalize_backward_map_step()
             sim.render_dye_from_backward_map()
+        elif sim.advection_scheme == 9:
+            sim.step_wenoz(sim.rho, sim.rho_1, sim.rho_2, sim.new_rho, sim.dq_rho)
+            sim.rho.copy_from(sim.new_rho)
+        elif sim.advection_scheme == 10:
+            sim.step_teno5(sim.rho, sim.rho_1, sim.rho_2, sim.new_rho, sim.dq_rho)
+            sim.rho.copy_from(sim.new_rho)
 
     # Compute error
     rho_num = sim.rho.to_numpy()
@@ -117,12 +94,10 @@ def run_test(scheme_id, res, T, dt, ic_type='smooth'):
 
 def main():
     schemes = {
-        0: "Semi-Lagrangian",
-        2: "MacCormack",
-        4: "WENO5",
-        6: "CIP",
-        7: "Particles",
-        8: "CMM",
+        4:  "WENO5",
+        8:  "CMM",
+        9:  "WENO-Z",
+        10: "TENO5",
     }
 
     resolutions = [32, 64, 128, 256]
@@ -137,8 +112,7 @@ def main():
         for sid, name in schemes.items():
             errors = []
             for i, res in enumerate(resolutions):
-                # dt = 0.05 / res for WENO5, 0.1 / res others
-                dt = 0.05 / res if sid == 4 else 0.1 / res
+                dt = 0.05 / res
                 err = run_test(sid, res, T, dt, ic_type=ic)
                 errors.append(err)
 

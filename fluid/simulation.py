@@ -26,11 +26,9 @@ class SimulationConfig:
     # anti-diffusion -- has no physical meaning.
     sharpen_strength: float = 0.0
     # Advection scheme (also settable as a runtime attribute on the sim
-    # instance). 0 = Semi-Lagrangian, 2 = Selle-style MacCormack + clamp,
-    # 4 = WENO5 + SSP-RK3, 5 = Hybrid (WENO5 on vel, MacCormack on rho),
-    # 6 = Hybrid (WENO5 on vel, CIP cubic-Hermite SL on rho with FC limit),
-    # 7 = Hybrid (WENO5 on vel, passive Lagrangian particles on rho),
-    # 8 = Hybrid (WENO5 on vel, Bidirectional Characteristic Mapping on rho).
+    # instance). 4 = WENO5 + SSP-RK3, 8 = WENO5 on vel + Bidirectional
+    # Characteristic Mapping on rho (bilinear render), 9 = WENO-Z + SSP-RK3,
+    # 10 = TENO5 + SSP-RK3.
     advection_scheme: int = 4
     # Remap trigger threshold for the Characteristic Mapping Method
     # (advection_scheme == 8). When the maximum self-consistency error
@@ -92,9 +90,6 @@ class FluidSimulation:
         self.p_temp = ti.field(float, shape=(self.res, self.res))
         self.div = ti.field(float, shape=(self.res, self.res))
 
-        # Temp pressure field for Jacobi
-        # Advection scheme: 0 = Semi-Lagrangian, 2 = Selle-style MacCormack,
-        # 4 = WENO5, 5 = Hybrid (WENO on vel, MacCormack on rho).
         self.advection_scheme = config.advection_scheme
 
         # RK3 intermediate fields
@@ -106,27 +101,6 @@ class FluidSimulation:
         self.vel_2 = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.dq_vel = ti.Vector.field(2, float, shape=(self.res, self.res))
 
-        # Scratch fields for the Selle-style MacCormack predictor (phi_hat).
-        # Used only when advection_scheme == 2. Kept separate from the RK3
-        # intermediates so the two schemes never share scratch state.
-        self.predict_rho = ti.field(float, shape=(self.res, self.res))
-        self.predict_vel = ti.Vector.field(2, float, shape=(self.res, self.res))
-
-        # CIP (advection_scheme == 6): gradient of rho is transported alongside
-        # rho itself, enabling cubic-Hermite reconstruction during advection.
-        # Vector field with .x = d rho / dx, .y = d rho / dy. new_grad_rho is
-        # the corrector scratch; the caller swaps after each CIP step.
-        self.grad_rho = ti.Vector.field(2, float, shape=(self.res, self.res))
-        self.new_grad_rho = ti.Vector.field(2, float, shape=(self.res, self.res))
-
-        # Passive Lagrangian dye (advection_scheme == 7): one particle per
-        # grid cell at init. Each particle carries a position (physical, in
-        # [0, 1]^2) and a weight (the dye intensity it transports). The
-        # cells are re-built from particles each step via bilinear splatting.
-        self.n_particles = self.res * self.res
-        self.particle_pos = ti.Vector.field(2, float, shape=(self.n_particles,))
-        self.particle_weight = ti.field(float, shape=(self.n_particles,))
-
         # Bidirectional Characteristic Mapping (advection_scheme == 8):
         # rho_source is the frozen dye snapshot at the most recent remap.
         # backward_map (X) maps current grid points back to their initial
@@ -134,29 +108,19 @@ class FluidSimulation:
         # (Y) is the per-cell forward trajectory from the remap moment;
         # used purely to detect when the maps have drifted enough that a
         # remap is needed. Both maps are reset to the identity at remap.
-        # MacCormack predictor/corrector scratch for advecting X reuses
-        # the same kernels as the rest of the advection schemes.
         self.rho_source = ti.field(float, shape=(self.res, self.res))
         self.backward_map = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.forward_map = ti.Vector.field(2, float, shape=(self.res, self.res))
-        self.predict_backward_map = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.new_backward_map = ti.Vector.field(2, float, shape=(self.res, self.res))
         # WENO5 + SSP-RK3 scratch for advecting the backward_map delta.
-        # Only read when cmm_use_weno_map_advection is True. Kept separate
-        # from vel_1 / vel_2 / dq_vel so vel's own WENO step never collides.
+        # Kept separate from vel_1 / vel_2 / dq_vel so vel's own WENO step
+        # never collides.
         self.delta_1 = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.delta_2 = ti.Vector.field(2, float, shape=(self.res, self.res))
         self.dq_delta = ti.Vector.field(2, float, shape=(self.res, self.res))
         # 0-d accumulator for the max-self-consistency-error reduction.
         # Mirrors the pattern of self._max_vel_norm.
         self._map_distortion = ti.field(float, shape=())
-        # Temporary toggles for evaluating CMM quality variants. The
-        # render mode is a 3-state cycle (0=bilinear, 1=Catmull-Rom,
-        # 2=monotone-cubic / PCHIP-style); the advection toggle picks
-        # between MacCormack-FC and WENO5+SSP-RK3 for the delta field.
-        # Both will be removed once a permanent choice is made.
-        self.cmm_render_mode = 2          # 0 bilinear, 1 catmull-rom, 2 monotone-cubic
-        self.cmm_use_weno_map_advection = True
 
         # Scalar 0-d field used as the accumulator for the max-CFL reduction
         # in max_cfl(). Lives on the simulation so we don't allocate per call.
@@ -178,8 +142,8 @@ class FluidSimulation:
         Kernel body for `init_patterns`. Sets velocity, pressure, and dye
         fields to zero, then paints the starting dye pattern (a grid of
         bright squares symmetric around the center). Kept separate from the
-        Python `init_patterns` wrapper so that wrapper can also seed the CIP
-        gradient field by calling another kernel after this one.
+        Python `init_patterns` wrapper so that wrapper can seed the CMM state
+        after the pattern is written.
         """
         self.rho.fill(0)
         self.vel.fill(0)
@@ -202,13 +166,9 @@ class FluidSimulation:
     def init_patterns(self):
         """
         Initialize the dye field with the built-in checkerboard pattern and
-        seed the per-scheme auxiliary state (CIP gradient, particle pool,
-        CMM source + maps) so any scheme can be selected immediately. The
-        extra kernel calls are cheap when the targeted scheme is off.
+        seed the CMM source + maps so scheme 8 can be selected immediately.
         """
         self._init_patterns_kernel()
-        self.init_grad_rho_from_rho()
-        self._init_particles_from_rho()
         self._init_cmm_state_from_rho()
 
 
@@ -241,19 +201,11 @@ class FluidSimulation:
         self.rho.from_numpy(dye_np)
         if self.bc_absorbing:
             self.apply_absorbing_rho_bc()
-        # Seed per-scheme auxiliary state from the loaded rho. No-op cost
-        # for schemes that don't read these.
-        self.init_grad_rho_from_rho()
-        self._init_particles_from_rho()
         self._init_cmm_state_from_rho()
 
     @ti.kernel
     def _fill_dye_kernel(self, x: float, y: float, radius: float, amount: float):
-        """
-        Kernel body for `fill_dye`. Adds dye in a circular region without
-        touching grad_rho; the Python wrapper refreshes the CIP gradient
-        afterward.
-        """
+        """Kernel body for `fill_dye`. Adds dye in a circular region."""
         for i, j in self.rho:
             dist_x = abs(i * self.dx - x)
             dist_y = abs(j * self.dx - y)
@@ -268,21 +220,17 @@ class FluidSimulation:
 
     def fill_dye(self, x: float, y: float, radius: float, amount: float):
         """
-        Adds dye in a circular region around (x, y). In Eulerian modes this
-        writes to the grid rho field and refreshes the CIP gradient. In
-        particle mode (scheme 7) this adds to the weight of every particle
-        in the affected disk. In CMM mode (scheme 8) it projects each
-        affected current-frame cell through the backward map and deposits
-        the dye into rho_source at the back-traced location, so the new
-        dye participates in the existing map without forcing a remap.
+        Adds dye in a circular region around (x, y). In Eulerian modes
+        (schemes 4, 9, 10) this writes to the grid rho field directly. In
+        CMM mode (scheme 8) it projects each affected current-frame cell
+        through the backward map and deposits the dye into rho_source at
+        the back-traced location, so the new dye participates in the
+        existing map without forcing a remap.
         """
         if self.advection_scheme == 8:
             self._fill_dye_cmm_kernel(x, y, radius, amount)
-        elif self.advection_scheme == 7:
-            self._fill_dye_particles_kernel(x, y, radius, amount)
         else:
             self._fill_dye_kernel(x, y, radius, amount)
-            self.init_grad_rho_from_rho()
 
     @ti.kernel
     def apply_force(self, x: float, y: float, f_x: float, f_y: float, radius: float):
@@ -459,158 +407,6 @@ class FluidSimulation:
                (1 - f) * g * q[i0, j1] + \
                f * g * q[i1, j1]
 
-    @ti.func
-    def cubic_sample(self, q, u, v):
-        """
-        Samples a field `q` at fractional coordinate (u, v) using a 4x4
-        Catmull-Rom cubic spline. Drop-in replacement for self.sample()
-        with the same (u, v) convention -- integer arguments coincide
-        with cell centers.
-
-        Catmull-Rom basis on [-1, 2] in local coords t:
-            b_{-1}(t) = -0.5 t (1 - t)^2
-            b_0   (t) = 1 + t^2 (1.5 t - 2.5)
-            b_1   (t) = 0.5 t (1 + t (4 - 3 t))
-            b_2   (t) = -0.5 t^2 (1 - t)
-        Tensor-product applied across rows then columns. Used by the CMM
-        render path when self.cmm_use_bicubic_render is True; sharper
-        than bilinear on smooth-image inputs at the cost of ~16 reads vs
-        4 and an extra ~30 fma ops.
-        """
-        i = int(ti.floor(u))
-        j = int(ti.floor(v))
-        fx = u - i
-        fy = v - j
-
-        # Catmull-Rom basis weights along x at the four sample columns
-        # (i-1, i, i+1, i+2). Same form along y.
-        bxm1 = -0.5 * fx * (1.0 - fx) * (1.0 - fx)
-        bx0  = 1.0 + fx * fx * (1.5 * fx - 2.5)
-        bx1  = 0.5 * fx * (1.0 + fx * (4.0 - 3.0 * fx))
-        bx2  = -0.5 * fx * fx * (1.0 - fx)
-        bym1 = -0.5 * fy * (1.0 - fy) * (1.0 - fy)
-        by0  = 1.0 + fy * fy * (1.5 * fy - 2.5)
-        by1  = 0.5 * fy * (1.0 + fy * (4.0 - 3.0 * fy))
-        by2  = -0.5 * fy * fy * (1.0 - fy)
-
-        # Index helpers honoring the same periodic / wall BC dispatch as
-        # the bilinear sample().
-        im1 = (i - 1) % self.res
-        i0  = i % self.res
-        ip1 = (i + 1) % self.res
-        ip2 = (i + 2) % self.res
-        jm1 = (j - 1) % self.res
-        j0  = j % self.res
-        jp1 = (j + 1) % self.res
-        jp2 = (j + 2) % self.res
-        if ti.static(self.bc_wall):
-            im1 = ti.math.clamp(i - 1, 0, self.res - 1)
-            i0  = ti.math.clamp(i,     0, self.res - 1)
-            ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
-            ip2 = ti.math.clamp(i + 2, 0, self.res - 1)
-            jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
-            j0  = ti.math.clamp(j,     0, self.res - 1)
-            jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
-            jp2 = ti.math.clamp(j + 2, 0, self.res - 1)
-
-        # 1D Catmull-Rom along each of the 4 contributing rows.
-        row_m1 = bxm1 * q[im1, jm1] + bx0 * q[i0, jm1] + bx1 * q[ip1, jm1] + bx2 * q[ip2, jm1]
-        row_0  = bxm1 * q[im1, j0 ] + bx0 * q[i0, j0 ] + bx1 * q[ip1, j0 ] + bx2 * q[ip2, j0 ]
-        row_p1 = bxm1 * q[im1, jp1] + bx0 * q[i0, jp1] + bx1 * q[ip1, jp1] + bx2 * q[ip2, jp1]
-        row_p2 = bxm1 * q[im1, jp2] + bx0 * q[i0, jp2] + bx1 * q[ip1, jp2] + bx2 * q[ip2, jp2]
-        return bym1 * row_m1 + by0 * row_0 + by1 * row_p1 + by2 * row_p2
-
-    @ti.func
-    def monotone_cubic_sample(self, q, u, v):
-        """
-        Samples a field `q` at fractional coordinate (u, v) using a
-        monotone cubic Hermite tensor product (PCHIP-style). Tangents
-        are estimated from local central differences and then passed
-        through `fc_limit` so the resulting cubic between any two
-        adjacent samples is provably monotone -- guaranteed no
-        overshoot, no Catmull-Rom-style ringing dips at sharp features.
-
-        Stencil: 4x4 cells (same footprint as Catmull-Rom). The cell
-        containing (u, v) is bracketed by columns i0..ip1 and rows
-        j0..jp1; tangents at those four bracketing samples require
-        the im1 / ip2 / jm1 / jp2 neighbors. Cost is comparable to
-        cubic_sample plus the FC limiter calls (10 limits total).
-
-        At local extrema (where the limiter zeroes the tangents) the
-        result degrades smoothly toward plain SL-like behavior. This
-        is the right trade-off for image content under flow: smooth
-        regions retain cubic crispness; sharp features stay clean
-        without grain.
-        """
-        i = int(ti.floor(u))
-        j = int(ti.floor(v))
-        fx = u - i
-        fy = v - j
-
-        # Standard Hermite basis at fx and fy.
-        Hx0 = 2.0 * fx * fx * fx - 3.0 * fx * fx + 1.0
-        Hx1 = fx * fx * fx - 2.0 * fx * fx + fx
-        Hx2 = -2.0 * fx * fx * fx + 3.0 * fx * fx
-        Hx3 = fx * fx * fx - fx * fx
-        Hy0 = 2.0 * fy * fy * fy - 3.0 * fy * fy + 1.0
-        Hy1 = fy * fy * fy - 2.0 * fy * fy + fy
-        Hy2 = -2.0 * fy * fy * fy + 3.0 * fy * fy
-        Hy3 = fy * fy * fy - fy * fy
-
-        # 4x4 stencil indices with periodic / wall BC dispatch.
-        im1 = (i - 1) % self.res
-        i0  = i % self.res
-        ip1 = (i + 1) % self.res
-        ip2 = (i + 2) % self.res
-        jm1 = (j - 1) % self.res
-        j0  = j % self.res
-        jp1 = (j + 1) % self.res
-        jp2 = (j + 2) % self.res
-        if ti.static(self.bc_wall):
-            im1 = ti.math.clamp(i - 1, 0, self.res - 1)
-            i0  = ti.math.clamp(i,     0, self.res - 1)
-            ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
-            ip2 = ti.math.clamp(i + 2, 0, self.res - 1)
-            jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
-            j0  = ti.math.clamp(j,     0, self.res - 1)
-            jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
-            jp2 = ti.math.clamp(j + 2, 0, self.res - 1)
-
-        # 1D monotone Hermite along each of the 4 contributing rows.
-        # Each row: estimate tangents via central differences at the two
-        # bracketing samples, FC-limit them against the secant, then
-        # evaluate the cubic at fx.
-        # Row j-1
-        a = q[im1, jm1]; b = q[i0, jm1]; c = q[ip1, jm1]; d = q[ip2, jm1]
-        sec = c - b
-        m0  = self.fc_limit(0.5 * (c - a), sec)
-        m1  = self.fc_limit(0.5 * (d - b), sec)
-        row_m1 = Hx0 * b + Hx1 * m0 + Hx2 * c + Hx3 * m1
-        # Row j
-        a = q[im1, j0]; b = q[i0, j0]; c = q[ip1, j0]; d = q[ip2, j0]
-        sec = c - b
-        m0  = self.fc_limit(0.5 * (c - a), sec)
-        m1  = self.fc_limit(0.5 * (d - b), sec)
-        row_0 = Hx0 * b + Hx1 * m0 + Hx2 * c + Hx3 * m1
-        # Row j+1
-        a = q[im1, jp1]; b = q[i0, jp1]; c = q[ip1, jp1]; d = q[ip2, jp1]
-        sec = c - b
-        m0  = self.fc_limit(0.5 * (c - a), sec)
-        m1  = self.fc_limit(0.5 * (d - b), sec)
-        row_p1 = Hx0 * b + Hx1 * m0 + Hx2 * c + Hx3 * m1
-        # Row j+2
-        a = q[im1, jp2]; b = q[i0, jp2]; c = q[ip1, jp2]; d = q[ip2, jp2]
-        sec = c - b
-        m0  = self.fc_limit(0.5 * (c - a), sec)
-        m1  = self.fc_limit(0.5 * (d - b), sec)
-        row_p2 = Hx0 * b + Hx1 * m0 + Hx2 * c + Hx3 * m1
-
-        # 1D monotone Hermite across the 4 row values in y.
-        sec_y = row_p1 - row_0
-        m0_y = self.fc_limit(0.5 * (row_p1 - row_m1), sec_y)
-        m1_y = self.fc_limit(0.5 * (row_p2 - row_0),  sec_y)
-        return Hy0 * row_0 + Hy1 * m0_y + Hy2 * row_p1 + Hy3 * m1_y
-
     @ti.kernel
     def _reduce_max_vel_norm(self):
         """
@@ -625,454 +421,12 @@ class FluidSimulation:
         """
         Returns the current maximum CFL number across the grid:
             CFL = max(|u|) * dt / dx
-        Values above ~1.0 indicate the per-step advection trajectory is
-        crossing more than one cell, at which point linear back-traces
-        (semi-Lagrangian, MacCormack) lose accuracy. Useful as a diagnostic
-        for whether observed artifacts are CFL-induced.
+        Values above ~1.0 indicate that per-step advection trajectories cross
+        more than one cell. Useful as a diagnostic for whether observed
+        artifacts are CFL-induced.
         """
         self._reduce_max_vel_norm()
         return float(self._max_vel_norm[None]) * self.dt / self.dx
-
-    @ti.kernel
-    def advect_semi_lagrangian(self, field: ti.template(), new_field: ti.template()):
-        """
-        Solves the advection equation ∂q/∂t + (u · ∇)q = 0 using the Semi-Lagrangian method.
-
-        Mathematical detail:
-        For every grid point x, we trace back along the velocity field to find where the
-        particle came from (assuming constant velocity over Δt):
-        x_prev = x - u(x) * Δt
-        Then we interpolate the field at x_prev to update the current grid cell:
-        q^{n+1}(x) = q^n(x_prev)
-        """
-        for i, j in field:
-            # Backtrace coordinate
-            p = ti.Vector([i + 0.5, j + 0.5]) - self.dt * self.vel[i, j] / self.dx
-            # Periodic wrap-around happens inside sample
-            new_field[i, j] = self.sample(field, p.x - 0.5, p.y - 0.5)
-
-
-    @ti.kernel
-    def advect_maccormack_predict(self, field: ti.template(), phi_hat: ti.template()):
-        """
-        Predictor step of the Selle-style semi-Lagrangian MacCormack scheme.
-
-        Performs one semi-Lagrangian back-trace from each grid cell along the
-        local velocity and stores the bilinearly interpolated value in phi_hat:
-
-            phi_hat(x) = field(x - u(x) * dt)
-
-        where x = (i + 0.5, j + 0.5) * dx is the cell center. This is
-        mathematically identical to one plain semi-Lagrangian advection step.
-        It is paired with advect_maccormack_correct, which uses phi_hat to
-        estimate and remove the diffusive error of this single SL pass.
-        """
-        for i, j in field:
-            # Back-trace location (positions in grid coordinates)
-            p = ti.Vector([i + 0.5, j + 0.5]) - self.dt * self.vel[i, j] / self.dx
-            phi_hat[i, j] = self.sample(field, p.x - 0.5, p.y - 0.5)
-
-    @ti.kernel
-    def advect_maccormack_correct(self, field: ti.template(),
-                                  phi_hat: ti.template(),
-                                  new_field: ti.template()):
-        """
-        Corrector step of the Selle-style semi-Lagrangian MacCormack scheme.
-
-        For each grid cell x = (i + 0.5, j + 0.5) * dx:
-
-        1. Forward-trace from x by +u(x) * dt to obtain x_fwd, and sample
-           phi_hat at that location to obtain phi_hat_hat. This estimates the
-           value the predictor would have produced if started one step in the
-           future and traced backward to x -- i.e. an estimate of the smearing
-           introduced by the predictor.
-
-        2. Form the corrected estimate
-                  phi_corrected = phi_hat[x] + 0.5 * (field[x] - phi_hat_hat)
-           which removes the predictor's leading-order bias.
-
-        3. Compute the donor neighborhood [lo, hi] over the bilinear support
-           (4 cells) at the back-traced location x_back = x - u(x)*dt.
-
-        4. Modified MacCormack: if phi_corrected lies inside [lo, hi], use
-           it; otherwise fall back to phi_hat[x] (the safe SL value). The
-           fallback avoids the stair-step / halo artifacts that hard
-           clamping to the [lo, hi] boundary produces.
-
-        Honors periodic vs wall boundary conditions through the same dispatch
-        used elsewhere in the file. Reference: Selle, Fedkiw, Kim, Liu,
-        Rossignac (2008), "An Unconditionally Stable MacCormack Method";
-        Bridson, "Fluid Simulation for Computer Graphics", 2nd ed., Ch. 5
-        (modified MacCormack fallback).
-        """
-        for i, j in field:
-            u = self.vel[i, j]
-
-            # Forward-trace location (grid coordinates), used to sample phi_hat
-            p_fwd = ti.Vector([i + 0.5, j + 0.5]) + self.dt * u / self.dx
-            phi_hat_hat = self.sample(phi_hat, p_fwd.x - 0.5, p_fwd.y - 0.5)
-
-            # Tentative second-order corrected value
-            phi_corrected = phi_hat[i, j] + 0.5 * (field[i, j] - phi_hat_hat)
-
-            # Back-trace location, used to find the donor neighborhood for the clamp
-            p_back = ti.Vector([i + 0.5, j + 0.5]) - self.dt * u / self.dx
-            i_b = int(ti.floor(p_back.x - 0.5))
-            j_b = int(ti.floor(p_back.y - 0.5))
-
-            # 2x2 donor stencil: the predictor's bilinear support.
-            # Component-wise min/max works for scalar and 2-vector fields,
-            # which is how the same kernel can advect both rho and vel.
-            i0 = i_b % self.res
-            i1 = (i_b + 1) % self.res
-            j0 = j_b % self.res
-            j1 = (j_b + 1) % self.res
-            if ti.static(self.bc_wall):
-                i0 = ti.math.clamp(i_b,     0, self.res - 1)
-                i1 = ti.math.clamp(i_b + 1, 0, self.res - 1)
-                j0 = ti.math.clamp(j_b,     0, self.res - 1)
-                j1 = ti.math.clamp(j_b + 1, 0, self.res - 1)
-            v00 = field[i0, j0]
-            v10 = field[i1, j0]
-            v01 = field[i0, j1]
-            v11 = field[i1, j1]
-            lo = ti.min(ti.min(v00, v10), ti.min(v01, v11))
-            hi = ti.max(ti.max(v00, v10), ti.max(v01, v11))
-
-            # Modified MacCormack: if the corrected value would have been
-            # clamped, fall back to the safe semi-Lagrangian predictor
-            # value instead of pinning to the boundary. The pinned-boundary
-            # variant produces stair-step / halo artifacts on sharp dye
-            # features; the fallback is smoother.
-            clamped = ti.math.clamp(phi_corrected, lo, hi)
-            new_field[i, j] = ti.select(
-                clamped == phi_corrected, phi_corrected, phi_hat[i, j]
-            )
-
-
-    @ti.kernel
-    def init_grad_rho_from_rho(self):
-        """
-        Computes grad_rho = nabla rho via central differences. Used to seed
-        the CIP gradient field after rho is set by an init method or by
-        fill_dye, so the CIP advection has a sensible starting gradient.
-        Honors periodic vs wall boundary conditions.
-        """
-        for i, j in self.rho:
-            im1 = (i - 1) % self.res
-            ip1 = (i + 1) % self.res
-            jm1 = (j - 1) % self.res
-            jp1 = (j + 1) % self.res
-            if ti.static(self.bc_wall):
-                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
-                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
-                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
-                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
-            gx = (self.rho[ip1, j] - self.rho[im1, j]) * 0.5 / self.dx
-            gy = (self.rho[i, jp1] - self.rho[i, jm1]) * 0.5 / self.dx
-            self.grad_rho[i, j] = ti.Vector([gx, gy])
-
-
-    @ti.func
-    def fc_limit(self, g: float, secant: float) -> float:
-        """
-        Fritsch-Carlson monotone-cubic limit for a Hermite tangent.
-
-        Given a cell-coord secant slope `secant` between two adjacent samples
-        and a stored tangent `g` at one of them (both in cell-coord units),
-        returns g clamped so the cubic Hermite over the cell is provably
-        monotone: tangent must share sign with the secant and its magnitude
-        must not exceed 3 * |secant|. If the secant is zero or the tangent
-        sign disagrees with it, the tangent is zeroed (this enforces local
-        extrema at sample points and prevents the cubic from creating new
-        ones). Reference: Fritsch, Carlson (1980) "Monotone Piecewise Cubic
-        Interpolation", SIAM J. Numer. Anal.
-        """
-        result = 0.0
-        if secant * g > 0.0:
-            # Tangent shares sign with the secant; cap magnitude at 3|secant|.
-            max_g = 3.0 * ti.abs(secant)
-            if ti.abs(g) > max_g:
-                # Preserve sign of secant (which equals sign of g here).
-                if secant > 0.0:
-                    result = max_g
-                else:
-                    result = -max_g
-            else:
-                result = g
-        return result
-
-    @ti.kernel
-    def advect_cip(self, field: ti.template(),
-                   grad_field: ti.template(),
-                   new_field: ti.template(),
-                   new_grad_field: ti.template()):
-        """
-        One CIP advection step on a scalar field with its gradient tracked.
-
-        For each grid cell x = (i + 0.5, j + 0.5) * dx:
-
-        1. Back-trace x_back = x - u(x) * dt and find the 2x2 donor
-           neighborhood (i0..i1, j0..j1). Local coords (u_loc, v_loc) in
-           [0, 1] give the fractional position inside this cell.
-
-        2. Read the 12 corner samples: field at the four cells (f00, f10,
-           f01, f11), grad_field.x at the same cells (gx00..gx11), and
-           grad_field.y at the same cells (gy00..gy11).
-
-        3. Evaluate the tensor-product cubic Hermite surface at
-           (u_loc, v_loc). With cell spacing 1 (cell-coordinate units),
-           the tangent basis functions multiply gradients converted to
-           cell units, so each gradient is scaled by dx before being
-           plugged into the Hermite basis.
-
-        4. The new field value is the surface value at (u_loc, v_loc); the
-           new gradient is the analytic partials of the same surface,
-           scaled back to physical units (divided by dx).
-
-        Cross-derivative d^2 rho / dx dy is NOT tracked; the bicubic
-        Hermite is therefore a tensor product with the cross term implicitly
-        set to zero at each corner. This is the standard simplification in
-        graphics CIP implementations; the resulting surface is C^1 along
-        cell edges and produces dramatically less diffusion than any value-
-        only scheme. Reference: Yabe, Aoki (1991), "A universal solver for
-        hyperbolic equations by cubic-polynomial interpolation".
-        """
-        # Standard Hermite basis on [0, 1] in cell-coordinate units.
-        # h00(t) = 2t^3 - 3t^2 + 1     (value at left endpoint)
-        # h10(t) = t^3 - 2t^2 + t      (tangent at left endpoint)
-        # h01(t) = -2t^3 + 3t^2        (value at right endpoint)
-        # h11(t) = t^3 - t^2           (tangent at right endpoint)
-        # Derivatives:
-        # h00'(t) = 6t^2 - 6t
-        # h10'(t) = 3t^2 - 4t + 1
-        # h01'(t) = -6t^2 + 6t
-        # h11'(t) = 3t^2 - 2t
-        for i, j in field:
-            # Back-trace location (cell-coordinate units).
-            p = ti.Vector([i + 0.5, j + 0.5]) - self.dt * self.vel[i, j] / self.dx
-            # Convert to sample()-style fractional position (0,0) at corner of cell (0,0)
-            u = p.x - 0.5
-            v = p.y - 0.5
-            i_b = int(ti.floor(u))
-            j_b = int(ti.floor(v))
-            tx = u - i_b
-            ty = v - j_b
-
-            i0 = i_b % self.res
-            i1 = (i_b + 1) % self.res
-            j0 = j_b % self.res
-            j1 = (j_b + 1) % self.res
-            if ti.static(self.bc_wall):
-                i0 = ti.math.clamp(i_b,     0, self.res - 1)
-                i1 = ti.math.clamp(i_b + 1, 0, self.res - 1)
-                j0 = ti.math.clamp(j_b,     0, self.res - 1)
-                j1 = ti.math.clamp(j_b + 1, 0, self.res - 1)
-
-            # Corner samples
-            f00 = field[i0, j0]; f10 = field[i1, j0]; f01 = field[i0, j1]; f11 = field[i1, j1]
-            g00 = grad_field[i0, j0]; g10 = grad_field[i1, j0]
-            g01 = grad_field[i0, j1]; g11 = grad_field[i1, j1]
-            # Gradients in cell-coordinate units (multiply by dx).
-            gx00 = g00.x * self.dx; gx10 = g10.x * self.dx
-            gx01 = g01.x * self.dx; gx11 = g11.x * self.dx
-            gy00 = g00.y * self.dx; gy10 = g10.y * self.dx
-            gy01 = g01.y * self.dx; gy11 = g11.y * self.dx
-
-            # Fritsch-Carlson monotone-cubic limiting. The Hermite cubic
-            # between two adjacent samples is provably monotone iff each
-            # tangent shares sign with the secant slope between the samples
-            # and has magnitude <= 3 |secant|. Limiting the corner gradients
-            # locally (per back-traced cell) before the Hermite eval kills
-            # the new-extremum overshoots that plain CIP otherwise produces
-            # everywhere -- at the cost of degrading toward plain SL near
-            # local extrema (which is the right trade-off).
-            #
-            # Each gradient component is constrained by exactly one edge of
-            # the donor cell: gx values by the two horizontal edges, gy
-            # values by the two vertical edges. Secants are in cell-coord
-            # units (cells are 1 unit apart by construction).
-            S_x_bot   = f10 - f00
-            S_x_top   = f11 - f01
-            S_y_left  = f01 - f00
-            S_y_right = f11 - f10
-            gx00 = self.fc_limit(gx00, S_x_bot)
-            gx10 = self.fc_limit(gx10, S_x_bot)
-            gx01 = self.fc_limit(gx01, S_x_top)
-            gx11 = self.fc_limit(gx11, S_x_top)
-            gy00 = self.fc_limit(gy00, S_y_left)
-            gy01 = self.fc_limit(gy01, S_y_left)
-            gy10 = self.fc_limit(gy10, S_y_right)
-            gy11 = self.fc_limit(gy11, S_y_right)
-
-            # Hermite basis values + derivatives at (tx, ty).
-            Hx0 = 2.0 * tx * tx * tx - 3.0 * tx * tx + 1.0
-            Hx1 = tx * tx * tx - 2.0 * tx * tx + tx           # multiplies gx (left tangent)
-            Hx2 = -2.0 * tx * tx * tx + 3.0 * tx * tx
-            Hx3 = tx * tx * tx - tx * tx                       # multiplies gx (right tangent)
-            dHx0 = 6.0 * tx * tx - 6.0 * tx
-            dHx1 = 3.0 * tx * tx - 4.0 * tx + 1.0
-            dHx2 = -6.0 * tx * tx + 6.0 * tx
-            dHx3 = 3.0 * tx * tx - 2.0 * tx
-
-            Hy0 = 2.0 * ty * ty * ty - 3.0 * ty * ty + 1.0
-            Hy1 = ty * ty * ty - 2.0 * ty * ty + ty
-            Hy2 = -2.0 * ty * ty * ty + 3.0 * ty * ty
-            Hy3 = ty * ty * ty - ty * ty
-            dHy0 = 6.0 * ty * ty - 6.0 * ty
-            dHy1 = 3.0 * ty * ty - 4.0 * ty + 1.0
-            dHy2 = -6.0 * ty * ty + 6.0 * ty
-            dHy3 = 3.0 * ty * ty - 2.0 * ty
-
-            # Helper: along each row j_fixed in {0, 1}, build the 1D cubic
-            # Hermite of f and of gy at the row. Then combine across rows
-            # with another 1D cubic Hermite in y using f-values + gy-values
-            # at the endpoints.
-            #
-            # Row at y=0: F_row0(tx) = f00 * Hx0 + gx00 * Hx1 + f10 * Hx2 + gx10 * Hx3
-            # Row at y=1: F_row1(tx) = f01 * Hx0 + gx01 * Hx1 + f11 * Hx2 + gx11 * Hx3
-            # Y-gradient at row y=0 evaluated at tx: G_row0(tx) =
-            #     gy00 * Hx0 + 0 * Hx1 + gy10 * Hx2 + 0 * Hx3      (cross-term = 0)
-            # Y-gradient at row y=1 evaluated at tx: G_row1(tx) similarly.
-            # Then sample value: F(tx, ty) = F_row0 * Hy0 + G_row0 * Hy1 + F_row1 * Hy2 + G_row1 * Hy3
-            F_row0 = f00 * Hx0 + gx00 * Hx1 + f10 * Hx2 + gx10 * Hx3
-            F_row1 = f01 * Hx0 + gx01 * Hx1 + f11 * Hx2 + gx11 * Hx3
-            G_row0 = gy00 * Hx0 + gy10 * Hx2
-            G_row1 = gy01 * Hx0 + gy11 * Hx2
-
-            new_f = F_row0 * Hy0 + G_row0 * Hy1 + F_row1 * Hy2 + G_row1 * Hy3
-
-            # New x-gradient: derivative of the surface in x at (tx, ty).
-            # In cell units: d/d(tx) of the surface above.
-            # d F_row / d(tx) = f * dHx0 + gx * dHx1 + f * dHx2 + gx * dHx3
-            dFdtx_row0 = f00 * dHx0 + gx00 * dHx1 + f10 * dHx2 + gx10 * dHx3
-            dFdtx_row1 = f01 * dHx0 + gx01 * dHx1 + f11 * dHx2 + gx11 * dHx3
-            # d G_row / d(tx) uses gy values (cross term zero so only h0/h2 basis)
-            dGdtx_row0 = gy00 * dHx0 + gy10 * dHx2
-            dGdtx_row1 = gy01 * dHx0 + gy11 * dHx2
-            new_gx_cell = (dFdtx_row0 * Hy0 + dGdtx_row0 * Hy1
-                           + dFdtx_row1 * Hy2 + dGdtx_row1 * Hy3)
-
-            # New y-gradient: derivative of the surface in y at (tx, ty).
-            # d F(tx, ty) / d(ty) = F_row0 * dHy0 + G_row0 * dHy1 + F_row1 * dHy2 + G_row1 * dHy3
-            new_gy_cell = (F_row0 * dHy0 + G_row0 * dHy1
-                           + F_row1 * dHy2 + G_row1 * dHy3)
-
-            new_field[i, j] = new_f
-            # Convert gradients back from cell-coordinate units to physical units.
-            new_grad_field[i, j] = ti.Vector([new_gx_cell / self.dx,
-                                              new_gy_cell / self.dx])
-
-
-    @ti.kernel
-    def _init_particles_from_rho(self):
-        """
-        Initializes the passive-Lagrangian dye particles from the current
-        rho field. One particle per grid cell: position = cell center,
-        weight = rho value at that cell. Called from init_patterns,
-        init_from_image, and any other code path that authoritatively sets
-        rho. The particle layout is the same independent of bc_type; only
-        the per-step advection differs.
-        """
-        for i, j in self.rho:
-            p_idx = i * self.res + j
-            self.particle_pos[p_idx] = ti.Vector([(i + 0.5) * self.dx,
-                                                   (j + 0.5) * self.dx])
-            self.particle_weight[p_idx] = self.rho[i, j]
-
-    @ti.kernel
-    def advect_particles_rk2(self):
-        """
-        Advances every particle one step via the RK2 midpoint method:
-            u0    = vel(x)
-            x_mid = x + 0.5 * dt * u0
-            u_mid = vel(x_mid)
-            x_new = x + dt * u_mid
-        Velocity is sampled from the simulation's grid via bilinear
-        interpolation (the existing `sample()` helper).
-
-        Boundary conditions: periodic wrap when bc_type='periodic',
-        clamp-to-edge otherwise. Particles are never removed; "absorbing"
-        only kills dye when the splat step writes the boundary rows of
-        rho to zero in apply_absorbing_rho_bc.
-        """
-        for p in range(self.n_particles):
-            x = self.particle_pos[p]
-            # sample() expects coords where integer == cell index;
-            # particle.pos is in physical units. Convert: cell-center coord
-            # = pos / dx, sample arg = cell-center coord - 0.5.
-            u0 = self.sample(self.vel, x.x / self.dx - 0.5, x.y / self.dx - 0.5)
-            x_mid = x + 0.5 * self.dt * u0
-            u_mid = self.sample(self.vel,
-                                x_mid.x / self.dx - 0.5,
-                                x_mid.y / self.dx - 0.5)
-            x_new = x + self.dt * u_mid
-
-            if ti.static(self.bc_wall):
-                x_new.x = ti.math.clamp(x_new.x, 0.0, 1.0)
-                x_new.y = ti.math.clamp(x_new.y, 0.0, 1.0)
-            else:
-                # Periodic wrap to [0, 1). Subtracting floor handles negative
-                # values correctly (Taichi's % follows the dividend's sign).
-                x_new.x = x_new.x - ti.floor(x_new.x)
-                x_new.y = x_new.y - ti.floor(x_new.y)
-            self.particle_pos[p] = x_new
-
-    @ti.kernel
-    def splat_particles_to_rho(self):
-        """
-        Bilinearly deposits each particle's weight into the four nearest
-        rho cells. Caller is responsible for zeroing rho before calling
-        (so multiple sources can be splatted into the same field if
-        desired). Atomic adds make the splat parallel-safe across particles
-        that happen to land in the same cell.
-        """
-        for p in range(self.n_particles):
-            x = self.particle_pos[p]
-            w = self.particle_weight[p]
-            u = x.x / self.dx - 0.5
-            v = x.y / self.dx - 0.5
-            i_b = int(ti.floor(u))
-            j_b = int(ti.floor(v))
-            fx = u - i_b
-            fy = v - j_b
-
-            i0 = i_b % self.res
-            i1 = (i_b + 1) % self.res
-            j0 = j_b % self.res
-            j1 = (j_b + 1) % self.res
-            if ti.static(self.bc_wall):
-                i0 = ti.math.clamp(i_b,     0, self.res - 1)
-                i1 = ti.math.clamp(i_b + 1, 0, self.res - 1)
-                j0 = ti.math.clamp(j_b,     0, self.res - 1)
-                j1 = ti.math.clamp(j_b + 1, 0, self.res - 1)
-
-            ti.atomic_add(self.rho[i0, j0], (1.0 - fx) * (1.0 - fy) * w)
-            ti.atomic_add(self.rho[i1, j0], fx         * (1.0 - fy) * w)
-            ti.atomic_add(self.rho[i0, j1], (1.0 - fx) * fy         * w)
-            ti.atomic_add(self.rho[i1, j1], fx         * fy         * w)
-
-    @ti.kernel
-    def _fill_dye_particles_kernel(self, x: float, y: float,
-                                   radius: float, amount: float):
-        """
-        Particle-mode equivalent of `_fill_dye_kernel`. Adds `amount` to
-        the weight of every particle whose current position is within
-        `radius` of (x, y). Total dye injected per click depends on local
-        particle density, which under sustained flow can vary somewhat
-        from the uniform grid-equivalent. Acceptable trade-off for v1.
-        """
-        for p in range(self.n_particles):
-            pos = self.particle_pos[p]
-            dist_x = ti.abs(pos.x - x)
-            dist_y = ti.abs(pos.y - y)
-            if ti.static(not self.bc_wall):
-                if dist_x > 0.5: dist_x = 1.0 - dist_x
-                if dist_y > 0.5: dist_y = 1.0 - dist_y
-            dist = ti.sqrt(dist_x * dist_x + dist_y * dist_y)
-            if dist < radius:
-                self.particle_weight[p] += amount
-
 
     @ti.kernel
     def _init_cmm_state_from_rho(self):
@@ -1083,9 +437,8 @@ class FluidSimulation:
           - forward_map[i, j] = cell_center(i, j)  (identity)
         backward_map stores the deformation delta(x) = X(x) - x rather
         than the absolute back-traced coordinate; this makes the field
-        continuous across periodic boundaries (otherwise the field would
-        have a step jump of size 1 at the seam, which MacCormack's
-        bilinear interpolation cannot handle correctly).
+        continuous across periodic boundaries (no seam-discontinuity in
+        the delta field under WENO5 advection).
         """
         for i, j in self.rho:
             self.rho_source[i, j] = self.rho[i, j]
@@ -1111,15 +464,14 @@ class FluidSimulation:
     @ti.kernel
     def _finalize_backward_map_step(self):
         """
-        Post-advection step for the backward map: copy MacCormack output
-        into backward_map AND subtract the source term u*dt. This source
-        term comes from rewriting the standard backward-map update
+        Post-advection step for the backward map: copies the WENO5+RK3
+        output into backward_map AND subtracts the per-step source term u*dt.
+        This source term comes from rewriting the standard backward-map update
             X^{n+1}(x) = X^n(x - u dt)
         in terms of delta = X - x:
             delta^{n+1}(x) = delta^n(x - u dt) - u(x) dt
-        where the first part is plain advection of delta (handled by the
-        preceding MacCormack pair) and the second part is the per-cell
-        source term applied here.
+        where the first part is plain advection of delta (handled by step_weno)
+        and the second part is the per-cell source term applied here.
         """
         for i, j in self.backward_map:
             self.backward_map[i, j] = (self.new_backward_map[i, j]
@@ -1164,46 +516,15 @@ class FluidSimulation:
                                           src.x / self.dx - 0.5,
                                           src.y / self.dx - 0.5)
 
-    @ti.kernel
-    def _render_dye_bicubic(self):
-        """Render variant: Catmull-Rom bicubic sampling at X(x). Sharper."""
-        for i, j in self.rho:
-            cx = (i + 0.5) * self.dx
-            cy = (j + 0.5) * self.dx
-            src = ti.Vector([cx, cy]) + self.backward_map[i, j]
-            self.rho[i, j] = self.cubic_sample(self.rho_source,
-                                                src.x / self.dx - 0.5,
-                                                src.y / self.dx - 0.5)
-
-    @ti.kernel
-    def _render_dye_monotone_cubic(self):
-        """Render variant: PCHIP-style monotone cubic at X(x). Cubic-
-        crispness without Catmull-Rom's ringing dips."""
-        for i, j in self.rho:
-            cx = (i + 0.5) * self.dx
-            cy = (j + 0.5) * self.dx
-            src = ti.Vector([cx, cy]) + self.backward_map[i, j]
-            self.rho[i, j] = self.monotone_cubic_sample(self.rho_source,
-                                                        src.x / self.dx - 0.5,
-                                                        src.y / self.dx - 0.5)
-
     def render_dye_from_backward_map(self):
         """
         Reconstructs rho for the current frame by sampling rho_source at
-        X(x) = x + delta(x). One interpolation per frame regardless of
-        how many advection steps have passed since the last remap, so
-        the rendered rho carries only single-interpolation error.
-        Dispatches between three render modes:
-            0 = bilinear (cheap, smooth, blurry)
-            1 = Catmull-Rom bicubic (sharp, but ringing at sharp features)
-            2 = monotone cubic (cubic crispness, no ringing)
+        X(x) = x + delta(x) via bilinear interpolation. One interpolation
+        per frame regardless of how many advection steps have passed since
+        the last remap, so the rendered rho carries only single-interpolation
+        error.
         """
-        if self.cmm_render_mode == 2:
-            self._render_dye_monotone_cubic()
-        elif self.cmm_render_mode == 1:
-            self._render_dye_bicubic()
-        else:
-            self._render_dye_bilinear()
+        self._render_dye_bilinear()
 
     @ti.kernel
     def _compute_map_distortion(self):
@@ -1339,6 +660,73 @@ class FluidSimulation:
         sum_alpha = alpha0 + alpha1 + alpha2
         return (alpha0 * p0 + alpha1 * p1 + alpha2 * p2) / sum_alpha
 
+    @ti.func
+    def wenoz_reconstruct(self, v1, v2, v3, v4, v5):
+        """WENO-Z 5th-order reconstruction (Borges et al. 2008).
+
+        Replaces the standard alpha_k = d_k / (eps + beta_k)^2 weights with
+        alpha_k = d_k * (1 + tau5 / (beta_k + eps))^2 where tau5 = |beta0 - beta2|
+        is a higher-order global smoothness indicator. In smooth flow tau5 = O(h^4)
+        while beta_k = O(h^2), so the ratio -> 0 and the weights collapse to the
+        ideal linear values d_k, recovering full 5th-order accuracy with less
+        numerical diffusion than standard WENO5.
+        """
+        eps = 1e-6
+        p0 = (2.0 * v1 - 7.0 * v2 + 11.0 * v3) / 6.0
+        p1 = (-v2 + 5.0 * v3 + 2.0 * v4) / 6.0
+        p2 = (2.0 * v3 + 5.0 * v4 - v5) / 6.0
+        beta0 = 13.0 / 12.0 * (v1 - 2.0 * v2 + v3)**2 + 0.25 * (v1 - 4.0 * v2 + 3.0 * v3)**2
+        beta1 = 13.0 / 12.0 * (v2 - 2.0 * v3 + v4)**2 + 0.25 * (v2 - v4)**2
+        beta2 = 13.0 / 12.0 * (v3 - 2.0 * v4 + v5)**2 + 0.25 * (3.0 * v3 - 4.0 * v4 + v5)**2
+        tau5 = ti.abs(beta0 - beta2)
+        alpha0 = 0.1 * (1.0 + (tau5 / (beta0 + eps))**2)
+        alpha1 = 0.6 * (1.0 + (tau5 / (beta1 + eps))**2)
+        alpha2 = 0.3 * (1.0 + (tau5 / (beta2 + eps))**2)
+        sum_alpha = alpha0 + alpha1 + alpha2
+        return (alpha0 * p0 + alpha1 * p1 + alpha2 * p2) / sum_alpha
+
+    @ti.func
+    def teno5_reconstruct(self, v1, v2, v3, v4, v5):
+        """TENO5 reconstruction (Fu, Hu, Adams 2016).
+
+        Uses the global smoothness indicator tau5 = |beta0 - beta2| to classify
+        each candidate stencil as smooth or non-smooth via binary thresholding.
+        Smooth stencils get their exact ideal linear weights (d_k), non-smooth
+        stencils are zeroed out. In smooth flow all three stencils pass the
+        threshold and the result is exactly the 5th-order upwind reconstruction --
+        sharper than both WENO5 and WENO-Z since no nonlinear weight distortion
+        remains.
+        """
+        eps = 1e-6
+        C_T = 1e-5
+        p0 = (2.0 * v1 - 7.0 * v2 + 11.0 * v3) / 6.0
+        p1 = (-v2 + 5.0 * v3 + 2.0 * v4) / 6.0
+        p2 = (2.0 * v3 + 5.0 * v4 - v5) / 6.0
+        beta0 = 13.0 / 12.0 * (v1 - 2.0 * v2 + v3)**2 + 0.25 * (v1 - 4.0 * v2 + 3.0 * v3)**2
+        beta1 = 13.0 / 12.0 * (v2 - 2.0 * v3 + v4)**2 + 0.25 * (v2 - v4)**2
+        beta2 = 13.0 / 12.0 * (v3 - 2.0 * v4 + v5)**2 + 0.25 * (3.0 * v3 - 4.0 * v4 + v5)**2
+        tau5 = ti.abs(beta0 - beta2)
+        # gamma_k grows large for stencils far from a discontinuity (smooth stencils)
+        # and stays near 1 for stencils spanning a discontinuity (bad stencils).
+        # Clamp the ratio before the ^6 to prevent float32 overflow when tau5 >> beta_k.
+        gamma0 = (1.0 + ti.math.min(tau5 / (beta0 + eps), 1e5)) ** 6
+        gamma1 = (1.0 + ti.math.min(tau5 / (beta1 + eps), 1e5)) ** 6
+        gamma2 = (1.0 + ti.math.min(tau5 / (beta2 + eps), 1e5)) ** 6
+        sum_gamma = gamma0 + gamma1 + gamma2
+        chi0 = gamma0 / sum_gamma
+        chi1 = gamma1 / sum_gamma
+        chi2 = gamma2 / sum_gamma
+        # step function: 1.0 if chi > C_T, else 0.0.
+        # sign+max avoids if/else, which fails for vector (vec2 velocity) fields.
+        delta0 = ti.math.max(ti.math.sign(chi0 - C_T), 0.0)
+        delta1 = ti.math.max(ti.math.sign(chi1 - C_T), 0.0)
+        delta2 = ti.math.max(ti.math.sign(chi2 - C_T), 0.0)
+        w0 = 0.1 * delta0
+        w1 = 0.6 * delta1
+        w2 = 0.3 * delta2
+        # chi0+chi1+chi2 = 1 guarantees max(chi_k) >= 1/3 >> C_T, so sum_w > 0 always.
+        return (w0 * p0 + w1 * p1 + w2 * p2) / (w0 + w1 + w2)
+
     @ti.kernel
     def advect_weno_rhs(self, field: ti.template(), dq: ti.template()):
         for i, j in field:
@@ -1419,6 +807,126 @@ class FluidSimulation:
         self.rk3_step2(field, field_1, field_2, dq)
 
         self.advect_weno_rhs(field_2, dq)
+        self.rk3_step3(field, field_2, new_field, dq)
+
+    @ti.kernel
+    def advect_wenoz_rhs(self, field: ti.template(), dq: ti.template()):
+        """Computes WENO-Z flux divergence RHS; identical structure to
+        advect_weno_rhs but calls wenoz_reconstruct for the face values."""
+        for i, j in field:
+            u = self.vel[i, j]
+            flux_x = field[i, j] * 0.0
+            flux_y = field[i, j] * 0.0
+            im3 = (i - 3) % self.res
+            im2 = (i - 2) % self.res
+            im1 = (i - 1) % self.res
+            ip1 = (i + 1) % self.res
+            ip2 = (i + 2) % self.res
+            ip3 = (i + 3) % self.res
+            jm3 = (j - 3) % self.res
+            jm2 = (j - 2) % self.res
+            jm1 = (j - 1) % self.res
+            jp1 = (j + 1) % self.res
+            jp2 = (j + 2) % self.res
+            jp3 = (j + 3) % self.res
+            if ti.static(self.bc_wall):
+                im3 = ti.math.clamp(i - 3, 0, self.res - 1)
+                im2 = ti.math.clamp(i - 2, 0, self.res - 1)
+                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+                ip2 = ti.math.clamp(i + 2, 0, self.res - 1)
+                ip3 = ti.math.clamp(i + 3, 0, self.res - 1)
+                jm3 = ti.math.clamp(j - 3, 0, self.res - 1)
+                jm2 = ti.math.clamp(j - 2, 0, self.res - 1)
+                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
+                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
+                jp2 = ti.math.clamp(j + 2, 0, self.res - 1)
+                jp3 = ti.math.clamp(j + 3, 0, self.res - 1)
+            if u.x > 0:
+                q_R = self.wenoz_reconstruct(field[im2, j], field[im1, j], field[i, j], field[ip1, j], field[ip2, j])
+                q_L = self.wenoz_reconstruct(field[im3, j], field[im2, j], field[im1, j], field[i, j], field[ip1, j])
+                flux_x = u.x * (q_R - q_L)
+            else:
+                q_R = self.wenoz_reconstruct(field[ip3, j], field[ip2, j], field[ip1, j], field[i, j], field[im1, j])
+                q_L = self.wenoz_reconstruct(field[ip2, j], field[ip1, j], field[i, j], field[im1, j], field[im2, j])
+                flux_x = u.x * (q_R - q_L)
+            if u.y > 0:
+                q_T = self.wenoz_reconstruct(field[i, jm2], field[i, jm1], field[i, j], field[i, jp1], field[i, jp2])
+                q_B = self.wenoz_reconstruct(field[i, jm3], field[i, jm2], field[i, jm1], field[i, j], field[i, jp1])
+                flux_y = u.y * (q_T - q_B)
+            else:
+                q_T = self.wenoz_reconstruct(field[i, jp3], field[i, jp2], field[i, jp1], field[i, j], field[i, jm1])
+                q_B = self.wenoz_reconstruct(field[i, jp2], field[i, jp1], field[i, j], field[i, jm1], field[i, jm2])
+                flux_y = u.y * (q_T - q_B)
+            dq[i, j] = -(flux_x + flux_y) / self.dx
+
+    def step_wenoz(self, field, field_1, field_2, new_field, dq):
+        """SSP-RK3 time integration using the WENO-Z spatial reconstruction."""
+        self.advect_wenoz_rhs(field, dq)
+        self.rk3_step1(field, field_1, dq)
+        self.advect_wenoz_rhs(field_1, dq)
+        self.rk3_step2(field, field_1, field_2, dq)
+        self.advect_wenoz_rhs(field_2, dq)
+        self.rk3_step3(field, field_2, new_field, dq)
+
+    @ti.kernel
+    def advect_teno5_rhs(self, field: ti.template(), dq: ti.template()):
+        """Computes TENO5 flux divergence RHS; identical structure to
+        advect_weno_rhs but calls teno5_reconstruct for the face values."""
+        for i, j in field:
+            u = self.vel[i, j]
+            flux_x = field[i, j] * 0.0
+            flux_y = field[i, j] * 0.0
+            im3 = (i - 3) % self.res
+            im2 = (i - 2) % self.res
+            im1 = (i - 1) % self.res
+            ip1 = (i + 1) % self.res
+            ip2 = (i + 2) % self.res
+            ip3 = (i + 3) % self.res
+            jm3 = (j - 3) % self.res
+            jm2 = (j - 2) % self.res
+            jm1 = (j - 1) % self.res
+            jp1 = (j + 1) % self.res
+            jp2 = (j + 2) % self.res
+            jp3 = (j + 3) % self.res
+            if ti.static(self.bc_wall):
+                im3 = ti.math.clamp(i - 3, 0, self.res - 1)
+                im2 = ti.math.clamp(i - 2, 0, self.res - 1)
+                im1 = ti.math.clamp(i - 1, 0, self.res - 1)
+                ip1 = ti.math.clamp(i + 1, 0, self.res - 1)
+                ip2 = ti.math.clamp(i + 2, 0, self.res - 1)
+                ip3 = ti.math.clamp(i + 3, 0, self.res - 1)
+                jm3 = ti.math.clamp(j - 3, 0, self.res - 1)
+                jm2 = ti.math.clamp(j - 2, 0, self.res - 1)
+                jm1 = ti.math.clamp(j - 1, 0, self.res - 1)
+                jp1 = ti.math.clamp(j + 1, 0, self.res - 1)
+                jp2 = ti.math.clamp(j + 2, 0, self.res - 1)
+                jp3 = ti.math.clamp(j + 3, 0, self.res - 1)
+            if u.x > 0:
+                q_R = self.teno5_reconstruct(field[im2, j], field[im1, j], field[i, j], field[ip1, j], field[ip2, j])
+                q_L = self.teno5_reconstruct(field[im3, j], field[im2, j], field[im1, j], field[i, j], field[ip1, j])
+                flux_x = u.x * (q_R - q_L)
+            else:
+                q_R = self.teno5_reconstruct(field[ip3, j], field[ip2, j], field[ip1, j], field[i, j], field[im1, j])
+                q_L = self.teno5_reconstruct(field[ip2, j], field[ip1, j], field[i, j], field[im1, j], field[im2, j])
+                flux_x = u.x * (q_R - q_L)
+            if u.y > 0:
+                q_T = self.teno5_reconstruct(field[i, jm2], field[i, jm1], field[i, j], field[i, jp1], field[i, jp2])
+                q_B = self.teno5_reconstruct(field[i, jm3], field[i, jm2], field[i, jm1], field[i, j], field[i, jp1])
+                flux_y = u.y * (q_T - q_B)
+            else:
+                q_T = self.teno5_reconstruct(field[i, jp3], field[i, jp2], field[i, jp1], field[i, j], field[i, jm1])
+                q_B = self.teno5_reconstruct(field[i, jp2], field[i, jp1], field[i, j], field[i, jm1], field[i, jm2])
+                flux_y = u.y * (q_T - q_B)
+            dq[i, j] = -(flux_x + flux_y) / self.dx
+
+    def step_teno5(self, field, field_1, field_2, new_field, dq):
+        """SSP-RK3 time integration using the TENO5 spatial reconstruction."""
+        self.advect_teno5_rhs(field, dq)
+        self.rk3_step1(field, field_1, dq)
+        self.advect_teno5_rhs(field_1, dq)
+        self.rk3_step2(field, field_1, field_2, dq)
+        self.advect_teno5_rhs(field_2, dq)
         self.rk3_step3(field, field_2, new_field, dq)
 
     @ti.kernel
@@ -1561,88 +1069,23 @@ class FluidSimulation:
         """
         self.time += self.dt
         # Advection
-        if self.advection_scheme == 0:
-            self.advect_semi_lagrangian(self.rho, self.new_rho)
-            self.rho.copy_from(self.new_rho)
-            self.advect_semi_lagrangian(self.vel, self.new_vel)
-            self.vel.copy_from(self.new_vel)
-        elif self.advection_scheme == 2:
-            # Selle-style semi-Lagrangian MacCormack with extrema clamp.
-            # The corrector cannot be written in-place because it reads field
-            # at the donor neighborhood around the back-traced location, so we
-            # write into new_rho / new_vel and copy back.
-            self.advect_maccormack_predict(self.rho, self.predict_rho)
-            self.advect_maccormack_correct(self.rho, self.predict_rho, self.new_rho)
-            self.rho.copy_from(self.new_rho)
-            self.advect_maccormack_predict(self.vel, self.predict_vel)
-            self.advect_maccormack_correct(self.vel, self.predict_vel, self.new_vel)
-            self.vel.copy_from(self.new_vel)
-
-        elif self.advection_scheme == 4:
+        if self.advection_scheme == 4:
             # WENO5 + SSP-RK3
             self.step_weno(self.rho, self.rho_1, self.rho_2, self.new_rho, self.dq_rho)
             self.rho.copy_from(self.new_rho)
             self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
             self.vel.copy_from(self.new_vel)
 
-        elif self.advection_scheme == 5:
-            # Hybrid: WENO5 advects velocity (best fine-structure resolution),
-            # MacCormack-SL advects rho (clamp keeps sharp dye edges crisp).
-            # The two transports are independent; rho is done first so that
-            # it is advected by the current velocity, not the just-updated
-            # one (consistent with the other scheme dispatches).
-            self.advect_maccormack_predict(self.rho, self.predict_rho)
-            self.advect_maccormack_correct(self.rho, self.predict_rho, self.new_rho)
-            self.rho.copy_from(self.new_rho)
-            self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
-            self.vel.copy_from(self.new_vel)
-
-        elif self.advection_scheme == 6:
-            # Hybrid: WENO5 on vel + CIP cubic-Hermite SL on rho. Same
-            # rho-first ordering as scheme 5. CIP also advects grad_rho
-            # alongside rho; we swap both fields back after the step.
-            self.advect_cip(self.rho, self.grad_rho,
-                            self.new_rho, self.new_grad_rho)
-            self.rho.copy_from(self.new_rho)
-            self.grad_rho.copy_from(self.new_grad_rho)
-            self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
-            self.vel.copy_from(self.new_vel)
-
-        elif self.advection_scheme == 7:
-            # Hybrid: WENO5 on vel + passive Lagrangian particles on rho.
-            # Particles are advected by sampling the grid velocity (RK2
-            # midpoint), then bilinear-splatted back into rho so that
-            # rendering and rho-dependent forces continue to work
-            # unchanged. The rho.fill(0) is necessary because the splat
-            # accumulates atomically; otherwise old values would persist.
-            self.advect_particles_rk2()
-            self.rho.fill(0.0)
-            self.splat_particles_to_rho()
-            self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
-            self.vel.copy_from(self.new_vel)
-
         elif self.advection_scheme == 8:
-            # Hybrid: WENO5 on vel + Bidirectional CMM on rho.
-            # 1) Advect the backward map X (stored as delta = X - x).
-            #    Dispatches between MacCormack-FC (2nd-order, cheaper) and
-            #    WENO5+SSP-RK3 (5th-order on smooth fields, ~3x cost) based
-            #    on cmm_use_weno_map_advection. WENO5 is near-exact on the
-            #    smooth delta field; dramatically reduces remap frequency.
+            # Hybrid: WENO5 on vel + Bidirectional CMM on rho (bilinear render).
+            # 1) Advect the backward map X (stored as delta = X - x) with WENO5+RK3.
             # 2) Advance the forward map Y by RK2 (Lagrangian trajectory).
-            # 3) Render rho by sampling rho_source at X. One interpolation
-            #    per frame regardless of step count -- bilinear or bicubic
-            #    based on cmm_use_bicubic_render.
+            # 3) Render rho by bilinearly sampling rho_source at X. One interpolation
+            #    per frame regardless of step count.
             # 4) Velocity as usual.
             # Remap-trigger check happens at the end of step().
-            if self.cmm_use_weno_map_advection:
-                self.step_weno(self.backward_map, self.delta_1, self.delta_2,
-                                self.new_backward_map, self.dq_delta)
-            else:
-                self.advect_maccormack_predict(self.backward_map,
-                                                self.predict_backward_map)
-                self.advect_maccormack_correct(self.backward_map,
-                                                self.predict_backward_map,
-                                                self.new_backward_map)
+            self.step_weno(self.backward_map, self.delta_1, self.delta_2,
+                            self.new_backward_map, self.dq_delta)
             # Combine the copy-back with the per-step source term u*dt
             # that the delta-formulation of the backward-map update
             # requires (see _finalize_backward_map_step docstring).
@@ -1650,6 +1093,22 @@ class FluidSimulation:
             self.advect_forward_map_rk2()
             self.render_dye_from_backward_map()
             self.step_weno(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
+            self.vel.copy_from(self.new_vel)
+
+        elif self.advection_scheme == 9:
+            # WENO-Z + SSP-RK3: recovers ideal 5th-order weights in smooth flow,
+            # sharper than WENO5 while retaining the same stability envelope.
+            self.step_wenoz(self.rho, self.rho_1, self.rho_2, self.new_rho, self.dq_rho)
+            self.rho.copy_from(self.new_rho)
+            self.step_wenoz(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
+            self.vel.copy_from(self.new_vel)
+
+        elif self.advection_scheme == 10:
+            # TENO5 + SSP-RK3: binary stencil selection via a global smoothness
+            # threshold; exact ideal weights in smooth flow, ENO-like near shocks.
+            self.step_teno5(self.rho, self.rho_1, self.rho_2, self.new_rho, self.dq_rho)
+            self.rho.copy_from(self.new_rho)
+            self.step_teno5(self.vel, self.vel_1, self.vel_2, self.new_vel, self.dq_vel)
             self.vel.copy_from(self.new_vel)
 
         # Optional per-step Laplacian-based unsharp pass on the dye field.

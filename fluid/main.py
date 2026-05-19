@@ -32,27 +32,19 @@ def main():
 
     # Simple UI state
     advection_names = {
-        0: "Semi-Lagrangian",
-        2: "MacCormack-SL",
         4: "WENO-5",
-        5: "Hybrid (WENO vel + MC rho)",
-        6: "Hybrid (WENO vel + CIP rho)",
-        7: "Hybrid (WENO vel + Particle rho)",
-        8: "Hybrid (WENO vel + Bidirectional CMM rho)",
+        8: "WENO-5 + Bidirectional CMM (bilinear)",
+        9: "WENO-Z",
+        10: "TENO5",
     }
 
     print("Controls:")
     print("  Mouse Left: Add Force (Drag)")
     print("  Mouse Right: Add Dye")
-    print("  Key 1: Semi-Lagrangian (Stable, Smooth)")
-    print("  Key 2: WENO-5")
-    print("  Key 3: Selle-style MacCormack with extrema clamp")
-    print("  Key 4: Hybrid (WENO vel + MacCormack rho)")
-    print("  Key 5: Hybrid (WENO vel + CIP rho)")
-    print("  Key 6: Hybrid (WENO vel + Lagrangian particle rho)")
-    print("  Key 7: Hybrid (WENO vel + Bidirectional CMM rho)")
-    print("  Key I: (CMM) cycle render interpolation (bilinear / Catmull-Rom / monotone-cubic)")
-    print("  Key A: (CMM) toggle map advection (MacCormack / WENO5)")
+    print("  Key 1: WENO-5")
+    print("  Key 2: WENO-Z")
+    print("  Key 3: TENO5")
+    print("  Key 4: WENO-5 + Bidirectional CMM (bilinear)")
     print("  Key R: Reset Patterns")
     print("  Key F: Apply force to bottom half")
     print("  Key B: Toggle dye gravity (persistent)")
@@ -75,23 +67,13 @@ def main():
             # Handle events
             if gui.get_event(ti.GUI.PRESS):
                 if gui.event.key == '1':
-                    sim.advection_scheme = 0
-                elif gui.event.key == '2':
                     sim.advection_scheme = 4
+                elif gui.event.key == '2':
+                    sim.advection_scheme = 9
                 elif gui.event.key == '3':
-                    sim.advection_scheme = 2
+                    sim.advection_scheme = 10
                 elif gui.event.key == '4':
-                    sim.advection_scheme = 5
-                elif gui.event.key == '5':
-                    sim.advection_scheme = 6
-                elif gui.event.key == '6':
-                    sim.advection_scheme = 7
-                elif gui.event.key == '7':
                     sim.advection_scheme = 8
-                elif gui.event.key == 'i':
-                    sim.cmm_render_mode = (sim.cmm_render_mode + 1) % 3
-                elif gui.event.key == 'a':
-                    sim.cmm_use_weno_map_advection = not sim.cmm_use_weno_map_advection
                 elif gui.event.key == 'r':
                     sim.time = 0.0
                     if config.init_type == 'patterns':
@@ -173,15 +155,6 @@ def main():
             cfl = sim.max_cfl()
             cfl_color = 0xFF3333 if cfl > 1.0 else 0xFFFFFF
             gui.text(f"max CFL: {cfl:.2f}", pos=(0.05, 0.75), color=cfl_color)
-            # CMM toggle states (only meaningful when scheme 8 is active).
-            # Temporary scaffolding for A/B-ing bilinear vs bicubic render
-            # and MacCormack vs WENO5 map advection.
-            if sim.advection_scheme == 8:
-                interp_labels = {0: "bilinear", 1: "catmull-rom", 2: "mono-cubic"}
-                interp_label = interp_labels[sim.cmm_render_mode]
-                adv_label = "WENO5" if sim.cmm_use_weno_map_advection else "MC-FC"
-                gui.text(f"CMM: render={interp_label}  map={adv_label}",
-                         pos=(0.05, 0.70), color=0xFFFFFF)
 
             # Recording indicator. Drawn after set_image so it appears in the
             # GUI window only; never enters the recorded video.
