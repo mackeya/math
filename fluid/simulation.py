@@ -15,6 +15,14 @@ class SimulationConfig:
     buoyancy_coeff: float = 0.0   # upward buoyancy proportional to dye density
     torque_coeff: float = 0.0     # counter-clockwise tangential force
     radial_coeff: float = 0.0     # outward radial force
+    # Magnus-like "lift" force: f = lift_coeff * rho * (u_y, -u_x). The force
+    # is perpendicular to the local velocity, weighted by dye density, so
+    # dye-rich regions deflect sideways relative to whatever flow is
+    # present. Requires a non-zero velocity field (from any of the other
+    # forces, or mouse drag) to do anything. Flip the sign to reverse the
+    # deflection direction. Typical useful range matches the other
+    # persistent-force coefficients (a few units).
+    lift_coeff: float = 0.0
     bc_type: str = 'periodic'   # 'periodic', 'wall', 'absorbing', or 'open'
     # 0.0 = no-slip, 1.0 = free-slip (only used when bc_type='wall').  All the action here happens above 0.99
     wall_slip: float = 0.0
@@ -272,11 +280,28 @@ class FluidSimulation:
                 self.vel[i, j] += ti.Vector([f_x, f_y]) * self.dt
 
     @ti.kernel
-    def _apply_persistent_force_kernel(self, b_coeff: float, t_coeff: float, r_coeff: float):
+    def _apply_persistent_force_kernel(self, b_coeff: float, t_coeff: float, r_coeff: float, l_coeff: float):
         """
         Applies persistent forces proportional to the dye density.
         Values are passed as arguments to ensure reactivity in Taichi.
         Forces are additive.
+
+        Parameters
+        ----------
+        b_coeff : float
+            Buoyancy strength: upward force proportional to rho.
+        t_coeff : float
+            Torque strength: counter-clockwise tangential force around the
+            domain center, weighted by (rho - 0.5).
+        r_coeff : float
+            Radial strength: outward force from the domain center,
+            proportional to rho.
+        l_coeff : float
+            Magnus-like "lift" strength: force perpendicular to the local
+            velocity (u_y, -u_x), weighted by rho. Produces sideways
+            deflection of dye-rich regions relative to whatever flow is
+            present. Zero with zero velocity, so requires another force
+            (or mouse drag) to do anything visible.
         """
         for i, j in self.vel:
             force = ti.Vector([0.0, 0.0])
@@ -296,14 +321,40 @@ class FluidSimulation:
             if dist > 1e-6:
                 force += (r / (dist + 0.1)) * r_coeff * rho
 
+            # Magnus-like lift: perpendicular to local velocity, dye-weighted.
+            # u x k_hat = (u_y, -u_x) in 2D, so this rotates the local
+            # velocity 90 degrees clockwise and scales by rho * l_coeff.
+            u = self.vel[i, j]
+            force += l_coeff * (rho - 0.5) * ti.Vector([u.y, -u.x])
+
             self.vel[i, j] += force * self.dt
 
 
-    def apply_image_gradient_torque(self, image_path: str, scale: float = 1.0, duration: float = 0.1, blur_sigma: float = 0.0):
+    def _load_image_to_numpy_array(self, image_path: str, blur_sigma: float = 0.0):
         """
-        Reads an image and sets up a force to be applied to the fluid equal to
-        the gradient of the image, spread over a certain duration.
-        The image can be blurred to reduce noise in the gradient calculation.
+        Load an image from disk and convert it into a 2D numpy float32 array
+        with the same orientation conventions used elsewhere in the
+        simulation (flipud + transpose so the image renders right-side up
+        under Taichi's (i, j) indexing).
+
+        A cosine-tapered vignette fades the outer 5% of the image to zero
+        so the loaded field has zero-valued boundaries -- this avoids
+        artifacts with periodic wrapping and keeps the image away from
+        absorbing/open boundaries.
+
+        Parameters
+        ----------
+        image_path : str
+            Path to the image file (any PIL-readable format).
+        blur_sigma : float
+            If > 0, applies a Gaussian blur of this radius before
+            converting. Useful for smoothing noisy gradients downstream.
+
+        Returns
+        -------
+        np.ndarray
+            A (res, res) float32 array with values in [0, 1], oriented
+            and vignetted, ready for `field.from_numpy(...)`.
         """
         from PIL import Image, ImageFilter
         import numpy as np
@@ -314,12 +365,15 @@ class FluidSimulation:
         if blur_sigma > 0:
             img = img.filter(ImageFilter.GaussianBlur(radius=blur_sigma))
 
+        # Normalize to [0, 1], flip vertically and transpose to match
+        # Taichi's (i, j) = (x, y) convention with origin at bottom-left.
         img_np = np.array(img, dtype=np.float32) / 255.0
         img_np = np.flipud(img_np)
         img_np = img_np.T
 
-        # Apply a vignette (edge fade) to avoid boundary artifacts with periodic wrapping
-        # We fade the outer 5% of the image to zero
+        # Apply a vignette (edge fade) to avoid boundary artifacts with
+        # periodic wrapping. We fade the outer 5% of the image to zero
+        # using a cosine taper for a smooth falloff.
         edge_width = 0.05
         x = np.linspace(0, 1, self.res)
         y = np.linspace(0, 1, self.res)
@@ -328,6 +382,7 @@ class FluidSimulation:
         mask = np.ones((self.res, self.res), dtype=np.float32)
 
         def get_mask(coord):
+            # Cosine-tapered fade: 1 in the interior, smoothly to 0 at edges.
             m = np.ones_like(coord)
             m = np.where(coord < edge_width, 0.5 - 0.5 * np.cos(np.pi * coord / edge_width), m)
             m = np.where(coord > 1.0 - edge_width, 0.5 - 0.5 * np.cos(np.pi * (1.0 - coord) / edge_width), m)
@@ -337,6 +392,15 @@ class FluidSimulation:
         mask *= get_mask(yv)
 
         img_np *= mask
+        return img_np
+
+    def apply_image_gradient_torque(self, image_path: str, scale: float = 1.0, duration: float = 0.1, blur_sigma: float = 0.0):
+        """
+        Reads an image and sets up a force to be applied to the fluid equal to
+        the gradient of the image, spread over a certain duration.
+        The image can be blurred to reduce noise in the gradient calculation.
+        """
+        img_np = self._load_image_to_numpy_array(image_path, blur_sigma)
 
         # Use p_temp as a temporary field to hold the image
         self.p_temp.from_numpy(img_np)
@@ -1213,7 +1277,8 @@ class FluidSimulation:
         self._apply_persistent_force_kernel(
             self.config.buoyancy_coeff,
             self.config.torque_coeff,
-            self.config.radial_coeff
+            self.config.radial_coeff,
+            self.config.lift_coeff
         )
 
         if self.bc_wall and not self.bc_open:
@@ -1234,7 +1299,7 @@ class FluidSimulation:
         if use_fft:
             self._solve_pressure_fft()
         else:
-            for _ in range(100):
+            for _ in range(50):
                 self.pressure_solve_jacobi(self.p, self.p_temp)
                 if self.bc_open:
                     self.apply_open_pressure_bc()

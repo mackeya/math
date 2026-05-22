@@ -1,23 +1,24 @@
 # CLAUDE.md
-Always write comments in the code, and docstrings for every function and class.
+Always write comments in the code, and docstrings for every function and class. Keep these concise and informative. No need for full sentences or paragraphs, but do describe the key components and functionality.
 Use informative function names, even if they have to be a bit longer. Example: `select_candidate_words` rather than just `select_candidates`.
 Use pure functions and simple classes whenever possible.
 Rather than running git commit, ask the user to commit the code themselves.
 
 ## Running
+The system contains no default `python`. Use the `python3` command instead.
 
 ```bash
 # Install dependencies
-pip install taichi numpy pillow imageio[ffmpeg]
+pip3 install taichi numpy pillow imageio[ffmpeg]
 
 # Run interactive simulation
-python main.py
+python3 main.py
 
 # Run convergence tests (benchmarks all advection schemes across resolutions)
-python test_convergence.py
+python3 test_convergence.py
 
 # Run dye force test
-python test_dye_force.py
+python3 test_dye_force.py
 ```
 
 ## Architecture

@@ -20,7 +20,7 @@ def main():
     #      velocity unconstrained at boundary
     # config.bc_type = 'open'
     config.bc_type = 'absorbing'
-    # config.bc_type = 'periodic'
+    config.bc_type = 'periodic'
 
     config.pressure_solver = 'fft' if config.bc_type == 'periodic' else 'jacobi'
 
@@ -54,6 +54,7 @@ def main():
     print("  Key D: Apply dye gradient force (gradual/dynamic)")
     print("  Key V: Toggle dye vortex (persistent)")
     print("  Key C: Toggle dye radial (persistent)")
+    print("  Key J: Toggle Magnus-like lift force (persistent)")
     print("  Key P: Cycle pressure solver (Jacobi → Multigrid → FFT)")
     print("  Key K: Decrease vorticity confinement strength")
     print("  Key L: Increase vorticity confinement strength")
@@ -107,6 +108,15 @@ def main():
                         sim.config.radial_coeff = DEFAULT_FORCE
                     else:
                         sim.config.radial_coeff = 0.0
+                elif gui.event.key == 'j':
+                    # Toggle Magnus-like lift force: dye-weighted force
+                    # perpendicular to local velocity. Does nothing on its own --
+                    # needs another force (or mouse drag) to seed velocity.
+                    if abs(sim.config.lift_coeff) < 1e-3:
+                        sim.config.lift_coeff = DEFAULT_FORCE
+                    else:
+                        sim.config.lift_coeff = 0.0
+                    print(f"Lift coeff: {sim.config.lift_coeff:.2f}")
                 elif gui.event.key == 'k':
                     # Decrease vorticity confinement strength (min 0).
                     sim.config.vorticity_confinement_strength = max(
