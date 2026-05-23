@@ -32,30 +32,38 @@ from simulation import FluidSimulation, SimulationConfig
 RES = 512                       # simulation grid resolution
 DT = 3e-4                       # time step
 INIT = 'image'                  # 'patterns' or 'image'
-INIT = 'patterns'
+# INIT = 'patterns'
 IMAGE_PATH = './lenna.png'
 N_STEPS = 2000                  # simulated time = N_STEPS * DT
-# BC_TYPE = 'periodic'           # matches main.py default
-BC_TYPE = 'absorbing'           # matches main.py default
+BC_TYPE = 'periodic'            # FFT solver requires periodic BC
+# BC_TYPE = 'absorbing'
 PERSISTENT_TORQUE = 0.0         # equivalent of pressing 'v' at startup
-PERSISTENT_BUOYANCY = 3.0       # equivalent of pressing 'b'
-PERSISTENT_RADIAL = 0.0         # equivalent of pressing 'c'
-PRESSURE_SOLVER = 'fft'         # jacobi, fft
+PERSISTENT_BUOYANCY = 0.0       # equivalent of pressing 'b'
+PERSISTENT_RADIAL = 3.0         # equivalent of pressing 'c'
+# pressure_solver is set per-configuration; see CONFIGURATIONS below
 
 OUTPUT_DIR = 'comparisons'
-OUTPUT_PREFIX = f't{N_STEPS * DT:.3f}s'
+OUTPUT_PREFIX = f't{N_STEPS * DT:.3f}s_{BC_TYPE}'
 
 # Configuration list. Each entry is (label, setup_fn). setup_fn takes a
 # constructed sim and is responsible for setting the advection scheme and
 # any scheme-specific toggles. The label is used in the PNG filename and
 # in the contact-sheet tile header.
 
+# Pressure-solver comparison. Mutating sim.config.pressure_solver after
+# construction is safe because the solver choice is read once per step,
+# not cached at init time.
 CONFIGURATIONS = [
-    ("WENO5",     lambda s: setattr(s, 'advection_scheme', 4)),
-    ("WENO-Z",    lambda s: setattr(s, 'advection_scheme', 9)),
-    ("TENO5",     lambda s: setattr(s, 'advection_scheme', 10)),
-    ("CMM",       lambda s: setattr(s, 'advection_scheme', 8)),
+    ("Jacobi", lambda s: setattr(s.config, 'pressure_solver', 'jacobi')),
+    ("FFT",    lambda s: setattr(s.config, 'pressure_solver', 'fft')),
 ]
+
+# CONFIGURATIONS = [
+#     ("WENO5",     lambda s: setattr(s, 'advection_scheme', 4)),
+#     ("WENO-Z",    lambda s: setattr(s, 'advection_scheme', 9)),
+#     ("TENO5",     lambda s: setattr(s, 'advection_scheme', 10)),
+#     ("CMM",       lambda s: setattr(s, 'advection_scheme', 8)),
+# ]
 
 
 # -- Image helpers -------------------------------------------------------
@@ -123,8 +131,7 @@ def main():
           f'{N_STEPS} steps = {sim_time:.3f}s simulated time')
     print(f'Init: {INIT}, BC: {BC_TYPE}, '
           f'persistent torque={PERSISTENT_TORQUE}, '
-          f'buoyancy={PERSISTENT_BUOYANCY}, radial={PERSISTENT_RADIAL}, '
-          f'pressure_solver={PRESSURE_SOLVER}')
+          f'buoyancy={PERSISTENT_BUOYANCY}, radial={PERSISTENT_RADIAL}')
     print()
 
     frames = []
@@ -136,7 +143,6 @@ def main():
             torque_coeff=PERSISTENT_TORQUE,
             buoyancy_coeff=PERSISTENT_BUOYANCY,
             radial_coeff=PERSISTENT_RADIAL,
-            pressure_solver=PRESSURE_SOLVER,
         ))
         if INIT == 'image':
             sim.init_from_image(IMAGE_PATH)

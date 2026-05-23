@@ -24,6 +24,7 @@ python3 test_dye_force.py
 ## Architecture
 
 This is a 2D incompressible fluid simulation using [Taichi](https://taichi-lang.org/) for GPU-accelerated computation.
+The main goal of the simulation is for artistic purposes, so results do not need to be totally scientifically accurate as long as they faithfully visually represent Eulerian, crisp, non-difussive fluid dynamics.
 
 **Core files:**
 - `simulation.py` — All simulation logic in `FluidSimulation` class with `SimulationConfig` dataclass

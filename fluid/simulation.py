@@ -1299,7 +1299,7 @@ class FluidSimulation:
         if use_fft:
             self._solve_pressure_fft()
         else:
-            for _ in range(50):
+            for _ in range(100):
                 self.pressure_solve_jacobi(self.p, self.p_temp)
                 if self.bc_open:
                     self.apply_open_pressure_bc()
