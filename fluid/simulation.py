@@ -55,6 +55,39 @@ class SimulationConfig:
     # is disabled. Typical useful range is 0.1–5.0; larger values increasingly
     # over-energise vortex cores and can cause instability.
     vorticity_confinement_strength: float = 0.0
+    # Curl-noise force amplitude. Adds a divergence-free perturbation derived
+    # from the 2D curl of a Perlin scalar field (F = (∂ψ/∂y, -∂ψ/∂x)). At 0.0
+    # the feature is disabled. Useful range ~0.1–5.0.
+    curl_noise_strength: float = 0.0
+    # Spatial frequency of the curl-noise field, in periods per unit domain.
+    # Larger values = smaller features.
+    curl_noise_scale: float = 4.0
+    # Temporal evolution rate of the curl-noise field. The noise input is
+    # translated by (time * this) so the field appears to drift.
+    curl_noise_time_scale: float = 0.5
+    # Vorticity-aligned drive: F = vd_coeff * ω * (-u_y, u_x). Rotates the
+    # local velocity by 90° in the sign-of-ω direction, scaled by vorticity.
+    # Positive feedback on rotational motion — tightens existing spirals.
+    # Distinct from vorticity confinement (which acts on grad|ω|). Useful at
+    # small magnitudes (0.1–1.0); larger values may go unstable.
+    vorticity_drive_coeff: float = 0.0
+    # Noise-driven gravity wells. N=n_gravity_wells point attractors whose
+    # positions drift via Perlin noise. Each well contributes
+    # sign_k * (c_k - x) / (||c_k - x||² + ε²) * rho. Signs alternate so some
+    # wells attract and some repel. At 0.0 the feature is disabled.
+    gravity_well_strength: float = 0.0
+    # How far each well's position drifts from its base location, in domain
+    # units (so 0.05 = 5% of the box width).
+    gravity_well_drift_amplitude: float = 0.05
+    # Temporal frequency of the drift (passed to Perlin).
+    gravity_well_drift_scale: float = 0.3
+    # Number of gravity wells. Fixed at construction time (used to size the
+    # attractor fields). Sign and base-position layout are set in __init__.
+    n_gravity_wells: int = 8
+    # Coriolis term: F = coriolis_coeff * (-u_y, u_x). Applies a sideways
+    # rotation to the velocity (independent of dye). Sign sets rotation
+    # direction. Generates planetary-scale rotational drift.
+    coriolis_coeff: float = 0.0
 
 ti.init(arch=ti.gpu) # Taichi will automatically fall back to CPU if GPU is not available
 
@@ -142,8 +175,45 @@ class FluidSimulation:
         # in max_cfl(). Lives on the simulation so we don't allocate per call.
         self._max_vel_norm = ti.field(float, shape=())
 
-        # Scalar vorticity ω = ∂v/∂x - ∂u/∂y, used by vorticity confinement.
+        # Scalar vorticity ω = ∂v/∂x - ∂u/∂y, used by vorticity confinement
+        # and the vorticity-aligned drive force.
         self.vorticity = ti.field(float, shape=(self.res, self.res))
+
+        # Perlin noise permutation table. Doubled length (512) so the lookup
+        # `perm[(i + offset) & 255]` style indexing in perlin2 never wraps.
+        # Used by both the curl-noise force and the gravity-well drift.
+        self.perm = ti.field(ti.i32, shape=(512,))
+        rng = np.random.default_rng(seed=1729)  # fixed seed for reproducibility
+        perm_np = np.arange(256, dtype=np.int32)
+        rng.shuffle(perm_np)
+        self.perm.from_numpy(np.concatenate([perm_np, perm_np]))
+
+        # Noise-driven gravity well state. Sized at construction; coefficient
+        # in config gates whether the kernel reads these. Base positions form
+        # a ring at radius 0.3 around the centre; signs alternate so half the
+        # wells attract and half repel. seed_offset[k] gives each well an
+        # independent Perlin trajectory.
+        n_wells = config.n_gravity_wells
+        self.n_gravity_wells = n_wells
+        self.attractor_pos = ti.Vector.field(2, float, shape=(n_wells,))
+        self.attractor_base_pos = ti.Vector.field(2, float, shape=(n_wells,))
+        self.attractor_sign = ti.field(float, shape=(n_wells,))
+        self.attractor_seed = ti.Vector.field(2, float, shape=(n_wells,))
+        base_np = np.zeros((n_wells, 2), dtype=np.float32)
+        sign_np = np.zeros((n_wells,), dtype=np.float32)
+        seed_np = np.zeros((n_wells, 2), dtype=np.float32)
+        for k in range(n_wells):
+            theta = 2.0 * np.pi * k / n_wells
+            base_np[k, 0] = 0.5 + 0.3 * np.cos(theta)
+            base_np[k, 1] = 0.5 + 0.3 * np.sin(theta)
+            sign_np[k] = 1.0 if (k % 2 == 0) else -1.0
+            # Spread the seed coords across noise space so well paths differ.
+            seed_np[k, 0] = float(k) * 17.3
+            seed_np[k, 1] = float(k) * 31.7 + 100.0
+        self.attractor_base_pos.from_numpy(base_np)
+        self.attractor_pos.from_numpy(base_np.copy())
+        self.attractor_sign.from_numpy(sign_np)
+        self.attractor_seed.from_numpy(seed_np)
 
         # Gradual force application
         self.image_grad = ti.Vector.field(2, float, shape=(self.res, self.res))
@@ -280,52 +350,128 @@ class FluidSimulation:
                 self.vel[i, j] += ti.Vector([f_x, f_y]) * self.dt
 
     @ti.kernel
-    def _apply_persistent_force_kernel(self, b_coeff: float, t_coeff: float, r_coeff: float, l_coeff: float):
+    def _update_attractor_positions_kernel(self, time: float, amplitude: float, drift_scale: float):
         """
-        Applies persistent forces proportional to the dye density.
-        Values are passed as arguments to ensure reactivity in Taichi.
-        Forces are additive.
+        Drifts gravity-well positions around their fixed base locations using
+        Perlin noise. Each well has independent (seed_x, seed_y) coordinates
+        so paths don't synchronize. Called once per simulation step when
+        gravity_well_strength != 0.
+        """
+        for k in self.attractor_base_pos:
+            base = self.attractor_base_pos[k]
+            seed = self.attractor_seed[k]
+            t = time * drift_scale
+            dx_off = self.perlin2(seed.x + t, seed.y)
+            dy_off = self.perlin2(seed.x,     seed.y + t)
+            self.attractor_pos[k] = base + amplitude * ti.Vector([dx_off, dy_off])
+
+    @ti.kernel
+    def _apply_persistent_force_kernel(
+        self,
+        b_coeff: float, t_coeff: float, r_coeff: float, l_coeff: float,
+        cn_strength: float, cn_scale: float, cn_time_scale: float, time: float,
+        vd_coeff: float,
+        gw_strength: float,
+        cor_coeff: float,
+    ):
+        """
+        Applies all persistent forces in a single fused kernel. Forces are
+        additive; each is gated by its own coefficient (zero = no contribution).
+        Coefficients are passed as arguments rather than read from config so
+        Taichi sees them as kernel parameters and recompiles correctly on
+        change.
 
         Parameters
         ----------
         b_coeff : float
-            Buoyancy strength: upward force proportional to rho.
+            Buoyancy: upward force proportional to rho.
         t_coeff : float
-            Torque strength: counter-clockwise tangential force around the
-            domain center, weighted by (rho - 0.5).
+            Torque: counter-clockwise tangential force around domain centre,
+            weighted by (rho - 0.5).
         r_coeff : float
-            Radial strength: outward force from the domain center,
-            proportional to rho.
+            Radial: outward force from domain centre, weighted by rho.
         l_coeff : float
-            Magnus-like "lift" strength: force perpendicular to the local
-            velocity (u_y, -u_x), weighted by rho. Produces sideways
-            deflection of dye-rich regions relative to whatever flow is
-            present. Zero with zero velocity, so requires another force
-            (or mouse drag) to do anything visible.
+            Magnus-like lift: perpendicular to local velocity, weighted by
+            (rho - 0.5). Needs an existing flow to do anything.
+        cn_strength, cn_scale, cn_time_scale : float
+            Curl-noise force. Force = strength * (∂ψ/∂y, -∂ψ/∂x) where ψ is
+            Perlin scalar noise sampled at (x*scale + 0.7*t*ts, y*scale +
+            0.3*t*ts). Scale controls feature size; ts controls drift rate.
+        time : float
+            Current simulation time (sim.time). Drives curl-noise drift.
+        vd_coeff : float
+            Vorticity-aligned drive: vd_coeff * ω * (-u_y, u_x). Rotates the
+            local velocity by 90° in the sign-of-ω direction. Positive
+            feedback on rotational motion.
+        gw_strength : float
+            Gravity-well strength multiplier. Each well contributes
+            sign_k * (c_k - x) / (||c_k - x||² + ε²) * rho.
+        cor_coeff : float
+            Coriolis: cor_coeff * (-u_y, u_x). Sign sets rotation direction.
         """
+        # Curl-noise sampling step in noise coords. Small relative to the
+        # Perlin lattice spacing (1) so the finite-difference curl is accurate.
+        eps = 0.001
+        # Gravity-well softening in domain coords (avoids 1/0 at well centres).
+        well_eps_sq = 0.0004  # = 0.02²
+
         for i, j in self.vel:
             force = ti.Vector([0.0, 0.0])
             rho = self.rho[i, j]
-            r = ti.Vector([i * self.dx - 0.5, j * self.dx - 0.5])
+            pos = ti.Vector([i * self.dx, j * self.dx])
+            r = pos - ti.Vector([0.5, 0.5])
             dist = r.norm()
+            u = self.vel[i, j]
 
-            # Buoyancy: upward force proportional to dye density
+            # Buoyancy: upward force proportional to dye density.
             force += ti.Vector([0.0, b_coeff * rho])
 
-            # Torque: counter-clockwise tangential force
+            # Torque: counter-clockwise tangential force around centre.
             if dist > 1e-6:
                 force_dir = ti.Vector([-r.y, r.x]) / dist
                 force += force_dir * t_coeff * (rho - 0.5)
 
-            # Radial: outward force from center
+            # Radial: outward force from centre, dye-weighted.
             if dist > 1e-6:
                 force += (r / (dist + 0.1)) * r_coeff * rho
 
-            # Magnus-like lift: perpendicular to local velocity, dye-weighted.
-            # u x k_hat = (u_y, -u_x) in 2D, so this rotates the local
-            # velocity 90 degrees clockwise and scales by rho * l_coeff.
-            u = self.vel[i, j]
+            # Magnus-like lift: perp to local velocity, dye-weighted.
             force += l_coeff * (rho - 0.5) * ti.Vector([u.y, -u.x])
+
+            # Curl-noise: divergence-free body force from curl of a scalar
+            # Perlin field. Translating the noise input over time makes the
+            # field appear to drift; the two coords drift at different rates
+            # so the apparent flow direction isn't purely diagonal.
+            if cn_strength != 0.0:
+                X = pos.x * cn_scale + time * cn_time_scale * 0.7
+                Y = pos.y * cn_scale + time * cn_time_scale * 0.3
+                psi_xp = self.perlin2(X + eps, Y)
+                psi_xm = self.perlin2(X - eps, Y)
+                psi_yp = self.perlin2(X, Y + eps)
+                psi_ym = self.perlin2(X, Y - eps)
+                dpsi_dx = (psi_xp - psi_xm) / (2.0 * eps)
+                dpsi_dy = (psi_yp - psi_ym) / (2.0 * eps)
+                force += cn_strength * ti.Vector([dpsi_dy, -dpsi_dx])
+
+            # Vorticity-aligned drive: rotates u by 90° in the sign-of-ω
+            # direction, scaled by ω. Distinct from vorticity confinement
+            # (which uses grad|ω|).
+            if vd_coeff != 0.0:
+                omega = self.vorticity[i, j]
+                force += vd_coeff * omega * ti.Vector([-u.y, u.x])
+
+            # Gravity wells: sum of softened inverse-square pulls, dye-weighted.
+            # The ti.static loop unrolls over the (compile-time-known) well count.
+            if gw_strength != 0.0:
+                well_force = ti.Vector([0.0, 0.0])
+                for k in ti.static(range(self.n_gravity_wells)):
+                    delta = self.attractor_pos[k] - pos
+                    d2 = delta.dot(delta)
+                    well_force += self.attractor_sign[k] * delta / (d2 + well_eps_sq)
+                force += gw_strength * rho * well_force
+
+            # Coriolis: body force independent of dye.
+            force += cor_coeff * ti.Vector([-u.y, u.x])
 
             self.vel[i, j] += force * self.dt
 
@@ -463,6 +609,65 @@ class FluidSimulation:
                f * (1 - g) * q[i1, j0] + \
                (1 - f) * g * q[i0, j1] + \
                f * g * q[i1, j1]
+
+    @ti.func
+    def _perlin_grad_dot(self, hsh: ti.i32, x: float, y: float) -> float:
+        """
+        Dot product of one Perlin corner's gradient vector with the offset
+        (x, y). The hash's low 3 bits select one of 8 gradient directions
+        (axis-aligned + diagonals). Used inside `perlin2`.
+        """
+        h = hsh & 7
+        g = 0.0
+        if h == 0:
+            g = x + y
+        elif h == 1:
+            g = -x + y
+        elif h == 2:
+            g = x - y
+        elif h == 3:
+            g = -x - y
+        elif h == 4:
+            g = x
+        elif h == 5:
+            g = -x
+        elif h == 6:
+            g = y
+        else:
+            g = -y
+        return g
+
+    @ti.func
+    def perlin2(self, x: float, y: float) -> float:
+        """
+        Classic 2D Perlin noise (improved-noise variant). Smooth, band-limited
+        scalar field in approximately [-1, 1]. Returns 0 at integer lattice
+        points; bilinearly interpolates four corner gradient dot products
+        with a quintic fade. Used by the curl-noise force and the gravity-
+        well drift.
+        """
+        # Integer lattice cell and fractional offset within it.
+        xi = ti.cast(ti.floor(x), ti.i32) & 255
+        yi = ti.cast(ti.floor(y), ti.i32) & 255
+        xf = x - ti.floor(x)
+        yf = y - ti.floor(y)
+        # Quintic Hermite fade 6t⁵ - 15t⁴ + 10t³ for C² continuity.
+        u = xf * xf * xf * (xf * (xf * 6.0 - 15.0) + 10.0)
+        v = yf * yf * yf * (yf * (yf * 6.0 - 15.0) + 10.0)
+        # Hash the four corners of the unit cell.
+        aa = self.perm[self.perm[xi]     + yi]
+        ab = self.perm[self.perm[xi]     + yi + 1]
+        ba = self.perm[self.perm[xi + 1] + yi]
+        bb = self.perm[self.perm[xi + 1] + yi + 1]
+        # Gradient · offset at each corner.
+        g00 = self._perlin_grad_dot(aa, xf,       yf)
+        g10 = self._perlin_grad_dot(ba, xf - 1.0, yf)
+        g01 = self._perlin_grad_dot(ab, xf,       yf - 1.0)
+        g11 = self._perlin_grad_dot(bb, xf - 1.0, yf - 1.0)
+        # Bilinear blend.
+        lx0 = g00 + u * (g10 - g00)
+        lx1 = g01 + u * (g11 - g01)
+        return lx0 + v * (lx1 - lx0)
 
     @ti.kernel
     def _reduce_max_vel_norm(self):
@@ -1274,11 +1479,32 @@ class FluidSimulation:
         else:
             self.dye_force_active = False
 
+        # Drift gravity-well positions on a Perlin path if the wells are
+        # active. Cheap (N is small) and only the well positions change here.
+        if self.config.gravity_well_strength != 0.0:
+            self._update_attractor_positions_kernel(
+                self.time,
+                self.config.gravity_well_drift_amplitude,
+                self.config.gravity_well_drift_scale,
+            )
+
+        # Vorticity-aligned drive reads self.vorticity inside the force
+        # kernel, so compute it here when that force is active.
+        if self.config.vorticity_drive_coeff != 0.0:
+            self._compute_vorticity()
+
         self._apply_persistent_force_kernel(
             self.config.buoyancy_coeff,
             self.config.torque_coeff,
             self.config.radial_coeff,
-            self.config.lift_coeff
+            self.config.lift_coeff,
+            self.config.curl_noise_strength,
+            self.config.curl_noise_scale,
+            self.config.curl_noise_time_scale,
+            self.time,
+            self.config.vorticity_drive_coeff,
+            self.config.gravity_well_strength,
+            self.config.coriolis_coeff,
         )
 
         if self.bc_wall and not self.bc_open:
@@ -1286,7 +1512,9 @@ class FluidSimulation:
 
         # Vorticity confinement: counteracts numerical diffusion of rotational
         # structures.  Applied after forces, before pressure solve, so the
-        # confinement force is included in the divergence correction.
+        # confinement force is included in the divergence correction. Recomputes
+        # vorticity (separate from the drive's earlier compute) so confinement
+        # sees the post-force velocity field as it always has.
         if self.config.vorticity_confinement_strength != 0.0:
             self._compute_vorticity()
             self._apply_vorticity_confinement(self.config.vorticity_confinement_strength)

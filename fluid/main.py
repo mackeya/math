@@ -10,7 +10,7 @@ def main():
 
     # Dye initialization
     config.init_type = 'patterns'
-    config.init_type = 'image'
+    # config.init_type = 'image'
 
     # Boundary conditions:
     # - 'periodic'
@@ -55,6 +55,10 @@ def main():
     print("  Key V: Toggle dye vortex (persistent)")
     print("  Key C: Toggle dye radial (persistent)")
     print("  Key J: Toggle Magnus-like lift force (persistent)")
+    print("  Key N: Toggle curl-noise force (persistent)")
+    print("  Key O: Toggle vorticity-aligned drive (persistent)")
+    print("  Key A: Toggle noise-driven gravity wells (persistent)")
+    print("  Key Z: Toggle Coriolis term (persistent)")
     print("  Key P: Cycle pressure solver (Jacobi → Multigrid → FFT)")
     print("  Key K: Decrease vorticity confinement strength")
     print("  Key L: Increase vorticity confinement strength")
@@ -113,10 +117,46 @@ def main():
                     # perpendicular to local velocity. Does nothing on its own --
                     # needs another force (or mouse drag) to seed velocity.
                     if abs(sim.config.lift_coeff) < 1e-3:
-                        sim.config.lift_coeff = DEFAULT_FORCE
+                        sim.config.lift_coeff = 10
                     else:
                         sim.config.lift_coeff = 0.0
                     print(f"Lift coeff: {sim.config.lift_coeff:.2f}")
+                elif gui.event.key == 'n':
+                    # Toggle curl-noise force: divergence-free body force from
+                    # the 2D curl of a Perlin scalar field. Animates from
+                    # nothing -- adds visible motion even in a quiescent sim.
+                    if abs(sim.config.curl_noise_strength) < 1e-3:
+                        sim.config.curl_noise_strength = 1.0
+                    else:
+                        sim.config.curl_noise_strength = 0.0
+                    print(f"Curl-noise strength: {sim.config.curl_noise_strength:.2f}")
+                elif gui.event.key == 'o':
+                    # Toggle vorticity-aligned drive: rotates u by 90° in the
+                    # sign-of-ω direction, scaled by |ω|. Tightens existing
+                    # spirals. Small magnitudes recommended -- positive feedback.
+                    if abs(sim.config.vorticity_drive_coeff) < 1e-3:
+                        sim.config.vorticity_drive_coeff = 3.5
+                    else:
+                        sim.config.vorticity_drive_coeff = 0.0
+                    print(f"Vorticity-drive coeff: {sim.config.vorticity_drive_coeff:.2f}")
+                elif gui.event.key == 'a':
+                    # Toggle noise-driven gravity wells: N attractors drifting
+                    # on Perlin paths, mixed signs so some attract and some
+                    # repel. Force is dye-weighted (acts where rho is non-zero).
+                    if abs(sim.config.gravity_well_strength) < 1e-3:
+                        sim.config.gravity_well_strength = 0.5
+                    else:
+                        sim.config.gravity_well_strength = 0.0
+                    print(f"Gravity-well strength: {sim.config.gravity_well_strength:.2f}")
+                elif gui.event.key == 'z':
+                    # Toggle Coriolis term: sideways body force F = coeff *
+                    # (-u_y, u_x). Drives slow large-scale rotation; sign
+                    # picks rotation direction.
+                    if abs(sim.config.coriolis_coeff) < 1e-3:
+                        sim.config.coriolis_coeff = 150.0
+                    else:
+                        sim.config.coriolis_coeff = 0.0
+                    print(f"Coriolis coeff: {sim.config.coriolis_coeff:.2f}")
                 elif gui.event.key == 'k':
                     # Decrease vorticity confinement strength (min 0).
                     sim.config.vorticity_confinement_strength = max(
