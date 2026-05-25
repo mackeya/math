@@ -56,12 +56,8 @@ def main():
     print("  Key C: Toggle dye radial (persistent)")
     print("  Key J: Toggle Magnus-like lift force (persistent)")
     print("  Key N: Toggle curl-noise force (persistent)")
-    print("  Key O: Toggle vorticity-aligned drive (persistent)")
-    print("  Key A: Toggle noise-driven gravity wells (persistent)")
-    print("  Key Z: Toggle Coriolis term (persistent)")
+    print("  Key A: Toggle gravity wells (persistent)")
     print("  Key P: Cycle pressure solver (Jacobi → Multigrid → FFT)")
-    print("  Key K: Decrease vorticity confinement strength")
-    print("  Key L: Increase vorticity confinement strength")
     print("  Key M: Toggle video recording (writes to ./recordings/)")
 
     prev_mouse = None
@@ -130,42 +126,15 @@ def main():
                     else:
                         sim.config.curl_noise_strength = 0.0
                     print(f"Curl-noise strength: {sim.config.curl_noise_strength:.2f}")
-                elif gui.event.key == 'o':
-                    # Toggle vorticity-aligned drive: rotates u by 90° in the
-                    # sign-of-ω direction, scaled by |ω|. Tightens existing
-                    # spirals. Small magnitudes recommended -- positive feedback.
-                    if abs(sim.config.vorticity_drive_coeff) < 1e-3:
-                        sim.config.vorticity_drive_coeff = 3.5
-                    else:
-                        sim.config.vorticity_drive_coeff = 0.0
-                    print(f"Vorticity-drive coeff: {sim.config.vorticity_drive_coeff:.2f}")
                 elif gui.event.key == 'a':
-                    # Toggle noise-driven gravity wells: N attractors drifting
-                    # on Perlin paths, mixed signs so some attract and some
-                    # repel. Force is dye-weighted (acts where rho is non-zero).
+                    # Toggle gravity wells: N fixed-position attractors with
+                    # mixed signs so some attract and some repel. Force is
+                    # dye-weighted (acts where rho is non-zero).
                     if abs(sim.config.gravity_well_strength) < 1e-3:
                         sim.config.gravity_well_strength = 0.5
                     else:
                         sim.config.gravity_well_strength = 0.0
                     print(f"Gravity-well strength: {sim.config.gravity_well_strength:.2f}")
-                elif gui.event.key == 'z':
-                    # Toggle Coriolis term: sideways body force F = coeff *
-                    # (-u_y, u_x). Drives slow large-scale rotation; sign
-                    # picks rotation direction.
-                    if abs(sim.config.coriolis_coeff) < 1e-3:
-                        sim.config.coriolis_coeff = 150.0
-                    else:
-                        sim.config.coriolis_coeff = 0.0
-                    print(f"Coriolis coeff: {sim.config.coriolis_coeff:.2f}")
-                elif gui.event.key == 'k':
-                    # Decrease vorticity confinement strength (min 0).
-                    sim.config.vorticity_confinement_strength = max(
-                        0.0, sim.config.vorticity_confinement_strength - 0.01)
-                    print(f"Vorticity confinement: {sim.config.vorticity_confinement_strength:.3f}")
-                elif gui.event.key == 'l':
-                    # Increase vorticity confinement strength.
-                    sim.config.vorticity_confinement_strength += 0.01
-                    print(f"Vorticity confinement: {sim.config.vorticity_confinement_strength:.3f}")
                 elif gui.event.key == 'm':
                     # Toggle video recording. Each press starts a new clip
                     # (with a fresh timestamped filename) or stops the
@@ -218,9 +187,6 @@ def main():
             cfl = sim.max_cfl()
             cfl_color = 0xFF3333 if cfl > 1.0 else 0xFFFFFF
             gui.text(f"max CFL: {cfl:.2f}", pos=(0.05, 0.75), color=cfl_color)
-            # Pressure solver and vorticity confinement state.
-            vc_str = f"{sim.config.vorticity_confinement_strength:.2f}"
-            gui.text(f"Vortex confinement: {vc_str}  [K / L]", pos=(0.05, 0.65), color=0xFFFFFF)
 
             # Recording indicator. Drawn after set_image so it appears in the
             # GUI window only; never enters the recorded video.
