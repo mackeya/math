@@ -3,6 +3,8 @@ import numpy as np
 from simulation import FluidSimulation, SimulationConfig
 from video_recorder import VideoRecorder
 
+# python3 main.py
+
 def main():
     config = SimulationConfig()
     config.res = 512
@@ -10,7 +12,7 @@ def main():
 
     # Dye initialization
     config.init_type = 'patterns'
-    # config.init_type = 'image'
+    config.init_type = 'image'
 
     # Boundary conditions:
     # - 'periodic'
@@ -20,7 +22,7 @@ def main():
     #      velocity unconstrained at boundary
     # config.bc_type = 'open'
     config.bc_type = 'absorbing'
-    config.bc_type = 'periodic'
+    # config.bc_type = 'periodic'
 
     config.pressure_solver = 'fft' if config.bc_type == 'periodic' else 'jacobi'
 
